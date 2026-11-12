@@ -102,7 +102,7 @@ change_icon() {
   local i
   for i in $(seq 1 20); do
     sleep 2
-    if resolve_launcher | grep -q "com.example.app/.${icon}"; then
+    if resolve_launcher | grep -q "name=com.example.app.${icon}"; then
       echo "Launcher component is now .${icon} after ${i} polls"
       resolve_launcher | tee "$OUT/resolve-after-${icon}.txt"
       adb logcat -d > "$OUT/logcat-${icon}.txt" || true

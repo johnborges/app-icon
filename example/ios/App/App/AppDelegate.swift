@@ -73,8 +73,14 @@ class AppDelegate: NSObject, UIApplicationDelegate {
     private func evidenceRecord(_ line: String) {
         NSLog("%@", line)
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("evidence-icon.txt")
-        let prior = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
-        try? (prior + line + "\n").write(to: url, atomically: true, encoding: .utf8)
+        let data = Data((line + "\n").utf8)
+        if FileManager.default.fileExists(atPath: url.path), let handle = try? FileHandle(forWritingTo: url) {
+            handle.seekToEndOfFile()
+            handle.write(data)
+            try? handle.close()
+        } else {
+            try? data.write(to: url)
+        }
     }
 
     private func evidenceBridge() -> CAPBridgeProtocol? {
