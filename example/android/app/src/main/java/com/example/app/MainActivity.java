@@ -1,5 +1,6 @@
 package com.example.app;
 
+import android.content.Intent;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -24,12 +25,19 @@ public class MainActivity extends BridgeActivity {
     }
 
     @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        // singleTask relaunches deliver the evidence extra here, not in getIntent().
+        setIntent(intent);
+    }
+
+    @Override
     public void onResume() {
         super.onResume();
         if (evidenceStarted) {
             return;
         }
-        String icon = getIntent().getStringExtra("evidenceIcon");
+        String icon = getIntent() == null ? null : getIntent().getStringExtra("evidenceIcon");
         if (icon == null) {
             return;
         }

@@ -26,7 +26,7 @@ class AppDelegate: NSObject, UIApplicationDelegate {
         for delay in [12.0, 20.0] {
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
                 let current = UIApplication.shared.alternateIconName ?? "nil"
-                evidenceRecord("EVIDENCE_NATIVE_ICON \(current)")
+                self.evidenceRecord("EVIDENCE_NATIVE_ICON \(current)")
             }
         }
     }
