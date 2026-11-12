@@ -1,0 +1,134 @@
+name: CAP9-02 example evidence
+
+on:
+  push:
+    branches:
+      - scratch/cap9-02-evidence
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  android:
+    name: Android example debug, release, and launcher icons
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: 21
+
+      - name: Build the plugin and example web app
+        run: |
+          npm ci
+          npm run build
+          cd example
+          npm ci
+          node -p "['core','cli','android','ios','app','device','haptics','keyboard'].map(n => n + ' ' + require('./node_modules/@capacitor/' + n + '/package.json').version).join('\n')"
+          npm run build
+          npx cap sync android
+
+      - name: Build debug and release
+        run: |
+          cd example/android
+          chmod +x ./gradlew
+          ./gradlew :app:assembleDebug :app:assembleRelease --stacktrace | tee "$GITHUB_WORKSPACE/android-build.log"
+
+      - name: Sign the release APK with a throwaway keystore
+        run: |
+          KEYSTORE="$RUNNER_TEMP/evidence.keystore"
+          keytool -genkeypair -keystore "$KEYSTORE" -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+          BT="$(echo "$ANDROID_SDK_ROOT"/build-tools/* | awk '{print $1}')"
+          "$BT/apksigner" sign --ks "$KEYSTORE" --ks-pass pass:android --key-pass pass:android \
+            --out example/android/app/build/outputs/apk/release/app-release-signed.apk \
+            example/android/app/build/outputs/apk/release/app-release-unsigned.apk
+          "$BT/apksigner" verify example/android/app/build/outputs/apk/release/app-release-signed.apk
+
+      - name: Upload Android build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          if-no-files-found: warn
+          name: android-build-log
+          path: android-build.log
+
+      - name: Launcher screenshots on an emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          disable-animations: true
+          emulator-boot-timeout: 600
+          emulator-options: -no-snapshot -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          script: |
+            export DEBUG_APK="$GITHUB_WORKSPACE/example/android/app/build/outputs/apk/debug/app-debug.apk"
+            export RELEASE_APK="$GITHUB_WORKSPACE/example/android/app/build/outputs/apk/release/app-release-signed.apk"
+            export EVIDENCE_DIR="$GITHUB_WORKSPACE/evidence-android"
+            bash "$GITHUB_WORKSPACE/.github/scripts/android-icon-evidence.sh"
+
+      - name: Upload Android launcher evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          if-no-files-found: warn
+          name: android-launcher-evidence
+          path: evidence-android/
+
+  ios:
+    name: iOS example simulator build and home-screen icons
+    runs-on: xcode-27
+    timeout-minutes: 60
+    steps:
+      - name: Show Xcode version
+        run: |
+          xcode-select -p
+          xcodebuild -version
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Build the plugin and example web app
+        run: |
+          npm ci
+          npm run build
+          cd example
+          npm ci
+          node -p "['core','cli','android','ios','app','device','haptics','keyboard'].map(n => n + ' ' + require('./node_modules/@capacitor/' + n + '/package.json').version).join('\n')"
+          npm run build
+          npx cap sync ios
+
+      - name: Pod install, simulator build, and home-screen screenshots
+        run: EVIDENCE_DIR="$GITHUB_WORKSPACE/evidence-ios" bash .github/scripts/ios-icon-evidence.sh
+
+      - name: Upload iOS evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          if-no-files-found: warn
+          name: ios-home-evidence
+          path: |
+            evidence-ios/xcode-version.txt
+            evidence-ios/xcodebuild.log
+            evidence-ios/pod-install.log
+            evidence-ios/ios-evidence.log
+            evidence-ios/ios-home-before-default.png
+            evidence-ios/ios-home-after-ionitron.png
+            evidence-ios/simctl-devices.txt
