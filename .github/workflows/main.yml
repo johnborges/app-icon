@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
 
 env:
-  NODE_VERSION: 20
+  NODE_VERSION: 24
   JAVA_VERSION: 21
 
 jobs:
@@ -46,9 +46,13 @@ jobs:
 
   verify-ios:
     name: Verify iOS
-    runs-on: macos-26
+    runs-on: xcode-27
     # needs: lint
     steps:
+      - name: Show Xcode version
+        run: |
+          xcode-select -p
+          xcodebuild -version
       - name: Checkout
         uses: actions/checkout@v4
       - name: Set up Node.js ${{ env.NODE_VERSION }}
