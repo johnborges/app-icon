@@ -63,16 +63,25 @@ jobs:
           name: android-build-log
           path: android-build.log
 
+      - name: Allow the runner to use KVM
+        run: |
+          ls -l /dev/kvm || true
+          getent group kvm || true
+          sudo chmod 666 /dev/kvm
+          sudo gpasswd -a "$USER" kvm || true
+          ls -l /dev/kvm
+
       - name: Launcher screenshots on an emulator
         uses: reactivecircus/android-emulator-runner@v2
         with:
-          api-level: 35
+          api-level: 34
           target: google_apis
           arch: x86_64
           profile: pixel_6
           disable-animations: true
-          emulator-boot-timeout: 600
-          emulator-options: -no-snapshot -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          disable-linux-hw-accel: false
+          emulator-boot-timeout: 900
+          emulator-options: -no-snapshot-save -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
           script: |
             export DEBUG_APK="$GITHUB_WORKSPACE/example/android/app/build/outputs/apk/debug/app-debug.apk"
             export RELEASE_APK="$GITHUB_WORKSPACE/example/android/app/build/outputs/apk/release/app-release-signed.apk"

@@ -27,15 +27,34 @@ if [ -z "$DEVICE_NAME" ]; then
   xcrun simctl list devices available | tee "$OUT/simctl-devices.txt"
   exit 1
 fi
+# Xcode 27 keeps Simulator.app inside the toolchain, not in /Applications.
+DEVROOT="$(xcode-select -p)"
+SIM_APP="$DEVROOT/Applications/Simulator.app"
+echo "Simulator.app: $SIM_APP"
+# Hardware keyboard lets Return reach the system icon alert.
+defaults write com.apple.iphonesimulator ConnectHardwareKeyboard -bool true || true
+
 dismiss_icon_alert() {
-  # The system icon alert's default button is OK. Return activates it when Simulator is focused.
+  # A click on the Simulator window becomes a touch on the device. The OK button
+  # sits just below the middle of an iPhone screen.
   osascript <<'EOF' || true
-tell application "Simulator" to activate
-delay 0.4
-tell application "System Events" to key code 36
+tell application "System Events"
+  if exists process "Simulator" then
+    tell process "Simulator"
+      set frontmost to true
+      keystroke return
+      if (count of windows) > 0 then
+        set w to window 1
+        set {px, py} to position of w
+        set {ww, wh} to size of w
+        click at {px + (ww / 2), py + (wh * 0.62)}
+      end if
+    end tell
+  else
+    log "Simulator process is not running"
+  end if
+end tell
 EOF
-  # Some Xcode versions also accept a simctl tap. Ignore it when the subcommand is absent.
-  xcrun simctl ui booted tap 200 480 >/dev/null 2>&1 || true
 }
 
 echo "Using simulator: $DEVICE_NAME"
@@ -66,8 +85,13 @@ UDID="$(printf '%s\n' "$DEVICE_LINE" | sed -E 's/.*\(([A-Fa-f0-9-]+)\).*/\1/')"
 echo "Booting $DEVICE_NAME ($UDID)"
 xcrun simctl boot "$UDID" || true
 xcrun simctl bootstatus "$UDID" -b
-open -a Simulator --args -CurrentDeviceUDID "$UDID" || true
-sleep 3
+if [ -d "$SIM_APP" ]; then
+  open "$SIM_APP" --args -CurrentDeviceUDID "$UDID" || true
+else
+  echo "Simulator.app was not at $SIM_APP" >&2
+  ls "$DEVROOT/Applications" || true
+fi
+sleep 8
 
 xcrun simctl install "$UDID" "$APP_PATH"
 # Launch once so SpringBoard places the icon, then leave the app.
@@ -78,29 +102,30 @@ sleep 3
 xcrun simctl io "$UDID" screenshot "$OUT/ios-home-before-default.png"
 ls -lh "$OUT/ios-home-before-default.png"
 
-# Follow the system log for the evidence hook while the plugin runs.
-xcrun simctl spawn "$UDID" log stream --style compact --timeout 50 --predicate 'composedMessage CONTAINS "EVIDENCE_" OR eventMessage CONTAINS "EVIDENCE_"' \
-  > "$OUT/ios-evidence.log" 2>&1 &
-LOG_PID=$!
-
 xcrun simctl launch "$UDID" com.example.app --evidence-change-icon ionitron
-# The public setAlternateIconName API shows a system alert and applies the icon when OK is tapped.
-sleep 10
+# The public API shows a system alert. The icon is applied when that alert is accepted.
+sleep 12
 dismiss_icon_alert
-sleep 3
+sleep 2
 dismiss_icon_alert
-sleep 8
+sleep 6
+xcrun simctl spawn "$UDID" log show --last 3m --style compact --predicate 'composedMessage CONTAINS "EVIDENCE_"' \
+  > "$OUT/ios-evidence.log" 2>&1 || true
+echo "=== evidence log ==="
+cat "$OUT/ios-evidence.log" || true
 xcrun simctl terminate "$UDID" com.example.app || true
-sleep 3
+sleep 2
+dismiss_icon_alert
+sleep 2
 xcrun simctl io "$UDID" screenshot "$OUT/ios-home-after-ionitron.png"
 ls -lh "$OUT/ios-home-after-ionitron.png"
 
-wait "$LOG_PID" || true
-echo "=== evidence log ==="
-cat "$OUT/ios-evidence.log" || true
-
+if ! grep -q "EVIDENCE_ICON_EVAL called" "$OUT/ios-evidence.log"; then
+  echo "Plugin change() was not invoked" >&2
+  exit 1
+fi
 if ! grep -q "EVIDENCE_NATIVE_ICON ionitron" "$OUT/ios-evidence.log"; then
-  echo "Plugin did not report the ionitron alternate icon" >&2
+  echo "alternateIconName did not become ionitron" >&2
   exit 1
 fi
 
