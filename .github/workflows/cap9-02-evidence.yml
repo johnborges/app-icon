@@ -82,11 +82,7 @@ jobs:
           disable-linux-hw-accel: false
           emulator-boot-timeout: 900
           emulator-options: -no-snapshot-save -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
-          script: |
-            export DEBUG_APK="$GITHUB_WORKSPACE/example/android/app/build/outputs/apk/debug/app-debug.apk"
-            export RELEASE_APK="$GITHUB_WORKSPACE/example/android/app/build/outputs/apk/release/app-release-signed.apk"
-            export EVIDENCE_DIR="$GITHUB_WORKSPACE/evidence-android"
-            bash "$GITHUB_WORKSPACE/.github/scripts/android-icon-evidence.sh"
+          script: bash "$GITHUB_WORKSPACE/.github/scripts/android-icon-evidence.sh"
 
       - name: Upload Android launcher evidence
         if: always()
@@ -141,3 +137,5 @@ jobs:
             evidence-ios/ios-home-before-default.png
             evidence-ios/ios-home-after-ionitron.png
             evidence-ios/simctl-devices.txt
+            evidence-ios/simctl-tap.txt
+            evidence-ios/simulator-app.txt

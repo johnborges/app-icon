@@ -2,8 +2,13 @@
 # Scratch-branch evidence: launcher screenshots before and after AppIcon.change.
 set -euo pipefail
 
-OUT="${EVIDENCE_DIR:-$PWD/evidence-android}"
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+OUT="${EVIDENCE_DIR:-$ROOT/evidence-android}"
+DEBUG_APK="${DEBUG_APK:-$ROOT/example/android/app/build/outputs/apk/debug/app-debug.apk}"
+RELEASE_APK="${RELEASE_APK:-$ROOT/example/android/app/build/outputs/apk/release/app-release-signed.apk}"
 mkdir -p "$OUT"
+echo "Debug APK: $DEBUG_APK"
+echo "Release APK: $RELEASE_APK"
 adb wait-for-device
 adb shell input keyevent KEYCODE_WAKEUP || true
 adb shell wm dismiss-keyguard || true
@@ -111,7 +116,7 @@ change_icon() {
   return 1
 }
 
-APK="${DEBUG_APK:?}"
+APK="$DEBUG_APK"
 echo "=== debug default icon ==="
 install_and_show_default "$OUT/android-launcher-before-default-stencil.png" "$OUT/android-launcher-before-default-stencil.xml"
 echo "=== debug change to ionic ==="
@@ -119,7 +124,7 @@ change_icon ionic stencil
 refresh_launcher
 capture_label "Ionic" "$OUT/android-launcher-after-debug-ionic.png" "$OUT/android-launcher-after-debug-ionic.xml"
 
-APK="${RELEASE_APK:?}"
+APK="$RELEASE_APK"
 echo "=== release default then change to ionitron ==="
 install_and_show_default "$OUT/android-launcher-before-release-stencil.png" "$OUT/android-launcher-before-release-stencil.xml"
 change_icon ionitron stencil

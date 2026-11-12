@@ -27,10 +27,9 @@ if [ -z "$DEVICE_NAME" ]; then
   xcrun simctl list devices available | tee "$OUT/simctl-devices.txt"
   exit 1
 fi
-# Xcode 27 keeps Simulator.app inside the toolchain, not in /Applications.
-DEVROOT="$(xcode-select -p)"
-SIM_APP="$DEVROOT/Applications/Simulator.app"
-echo "Simulator.app: $SIM_APP"
+# Xcode 27 does not put Simulator.app at the historical Developer/Applications path.
+SIM_APP="$(/usr/bin/find /Applications /Library/Developer -name Simulator.app -type d 2>/dev/null | head -1 || true)"
+echo "Simulator.app: ${SIM_APP:-not found}"
 # Hardware keyboard lets Return reach the system icon alert.
 defaults write com.apple.iphonesimulator ConnectHardwareKeyboard -bool true || true
 
@@ -85,11 +84,10 @@ UDID="$(printf '%s\n' "$DEVICE_LINE" | sed -E 's/.*\(([A-Fa-f0-9-]+)\).*/\1/')"
 echo "Booting $DEVICE_NAME ($UDID)"
 xcrun simctl boot "$UDID" || true
 xcrun simctl bootstatus "$UDID" -b
-if [ -d "$SIM_APP" ]; then
+if [ -n "$SIM_APP" ] && [ -d "$SIM_APP" ]; then
   open "$SIM_APP" --args -CurrentDeviceUDID "$UDID" || true
 else
-  echo "Simulator.app was not at $SIM_APP" >&2
-  ls "$DEVROOT/Applications" || true
+  echo "Simulator.app was not found on this runner" | tee "$OUT/simulator-app.txt"
 fi
 sleep 8
 
@@ -103,22 +101,38 @@ xcrun simctl io "$UDID" screenshot "$OUT/ios-home-before-default.png"
 ls -lh "$OUT/ios-home-before-default.png"
 
 xcrun simctl launch "$UDID" com.example.app --evidence-change-icon ionitron
-# The public API shows a system alert. The icon is applied when that alert is accepted.
-sleep 12
+# The public API shows a system alert. Give the plugin time, then try to accept it.
+sleep 14
+# simctl ui tap is point-based. The OK button is near the middle of an iPhone 17 screen.
+{
+  echo "=== simctl ui help ==="
+  xcrun simctl ui help || true
+  echo "=== taps ==="
+  xcrun simctl ui "$UDID" tap 201 480 || true
+  xcrun simctl ui "$UDID" tap 201 540 || true
+  xcrun simctl ui "$UDID" tap 201 600 || true
+} > "$OUT/simctl-tap.txt" 2>&1 || true
 dismiss_icon_alert
-sleep 2
-dismiss_icon_alert
-sleep 6
-xcrun simctl spawn "$UDID" log show --last 3m --style compact --predicate 'composedMessage CONTAINS "EVIDENCE_"' \
-  > "$OUT/ios-evidence.log" 2>&1 || true
-echo "=== evidence log ==="
-cat "$OUT/ios-evidence.log" || true
+sleep 3
 xcrun simctl terminate "$UDID" com.example.app || true
 sleep 2
+xcrun simctl ui "$UDID" tap 201 540 > "$OUT/simctl-tap-after.txt" 2>&1 || true
 dismiss_icon_alert
 sleep 2
 xcrun simctl io "$UDID" screenshot "$OUT/ios-home-after-ionitron.png"
 ls -lh "$OUT/ios-home-after-ionitron.png"
+
+CONTAINER="$(xcrun simctl get_app_container "$UDID" com.example.app data)"
+EVIDENCE_FILE="$CONTAINER/tmp/evidence-icon.txt"
+echo "Evidence file: $EVIDENCE_FILE"
+if [ -f "$EVIDENCE_FILE" ]; then
+  cp "$EVIDENCE_FILE" "$OUT/ios-evidence.log"
+else
+  echo "evidence file missing" | tee "$OUT/ios-evidence.log"
+  find "$CONTAINER" -name evidence-icon.txt -print || true
+fi
+echo "=== evidence log ==="
+cat "$OUT/ios-evidence.log"
 
 if ! grep -q "EVIDENCE_ICON_EVAL called" "$OUT/ios-evidence.log"; then
   echo "Plugin change() was not invoked" >&2

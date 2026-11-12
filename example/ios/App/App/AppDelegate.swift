@@ -16,17 +16,17 @@ class AppDelegate: NSObject, UIApplicationDelegate {
         }
         let iconName = args[flag + 1]
         guard ["ionic", "stencil", "ionitron"].contains(iconName) else {
-            NSLog("EVIDENCE_ICON_ERR rejected name \(iconName)")
+            evidenceRecord("EVIDENCE_ICON_ERR rejected name \(iconName)")
             return
         }
-        NSLog("EVIDENCE_ICON_REQUEST \(iconName)")
+        evidenceRecord("EVIDENCE_ICON_REQUEST \(iconName)")
         DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
             self.evidenceInvokeChange(iconName, attempt: 0)
         }
         for delay in [12.0, 20.0] {
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
                 let current = UIApplication.shared.alternateIconName ?? "nil"
-                NSLog("EVIDENCE_NATIVE_ICON \(current)")
+                evidenceRecord("EVIDENCE_NATIVE_ICON \(current)")
             }
         }
     }
@@ -38,7 +38,7 @@ class AppDelegate: NSObject, UIApplicationDelegate {
                     self.evidenceInvokeChange(iconName, attempt: attempt + 1)
                 }
             } else {
-                NSLog("EVIDENCE_ICON_ERR bridge not ready")
+                evidenceRecord("EVIDENCE_ICON_ERR bridge not ready")
             }
             return
         }
@@ -54,10 +54,10 @@ class AppDelegate: NSObject, UIApplicationDelegate {
         """
         bridge.webView?.evaluateJavaScript(js) { result, error in
             if let error {
-                NSLog("EVIDENCE_ICON_ERR eval \(error.localizedDescription)")
+                self.evidenceRecord("EVIDENCE_ICON_ERR eval \(error.localizedDescription)")
             }
             let value = result as? String ?? String(describing: result ?? "nil")
-            NSLog("EVIDENCE_ICON_EVAL \(value)")
+            self.evidenceRecord("EVIDENCE_ICON_EVAL \(value)")
             if value.contains("wait"), attempt < 12 {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
                     self.evidenceInvokeChange(iconName, attempt: attempt + 1)
@@ -66,8 +66,15 @@ class AppDelegate: NSObject, UIApplicationDelegate {
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
             let current = UIApplication.shared.alternateIconName ?? "nil"
-            NSLog("EVIDENCE_NATIVE_ICON \(current)")
+            self.evidenceRecord("EVIDENCE_NATIVE_ICON \(current)")
         }
+    }
+
+    private func evidenceRecord(_ line: String) {
+        NSLog("%@", line)
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("evidence-icon.txt")
+        let prior = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+        try? (prior + line + "\n").write(to: url, atomically: true, encoding: .utf8)
     }
 
     private func evidenceBridge() -> CAPBridgeProtocol? {
