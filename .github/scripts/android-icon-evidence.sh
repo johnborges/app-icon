@@ -46,22 +46,61 @@ open_drawer() {
   sleep 2
 }
 
-# Stay on the home screen. The example's launcher alias lands in the dock.
+home_shows() {
+  local label="$1" xml="$2"
+  adb shell input keyevent KEYCODE_HOME
+  sleep 2
+  dump_ui "$xml" || true
+  grep -q "text=\"${label}\"" "$xml" 2>/dev/null
+}
+
+# Drag the labeled icon out of the drawer onto the home workspace. Restarting
+# the Pixel launcher replaces the dock slot with a predicted app, so this is
+# the fallback when the existing home shortcut did not update in place.
+pin_label_to_home() {
+  local label="$1"
+  local xml="$OUT/drawer-${label}.xml"
+  open_drawer
+  dump_ui "$xml" || return 1
+  local coords
+  coords="$(python3 - "$xml" "$label" <<'PY'
+import re, sys
+xml = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+label = sys.argv[2]
+for node in re.findall(r"<node\b[^>]*>", xml):
+    if f'text="{label}"' not in node and f'content-desc="{label}"' not in node:
+        continue
+    match = re.search(r'bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"', node)
+    if match:
+        x1, y1, x2, y2 = map(int, match.groups())
+        print((x1 + x2) // 2, (y1 + y2) // 2)
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+)" || return 1
+  local x y W H
+  read -r x y <<<"$coords"
+  read -r W H < <(screen_size)
+  adb shell input swipe "$x" "$y" $((W / 2)) $((H * 32 / 100)) 1600
+  sleep 2
+}
+
+# Stay on the home screen. Do not restart the launcher here: a force-stop
+# drops the example shortcut and fills the dock with a predicted app.
 capture_home() {
   local label="$1"
   local png="$2"
   local xml="$3"
   local i
-  for i in 1 2 3 4 5 6; do
-    adb shell input keyevent KEYCODE_HOME
-    sleep 2
-    dump_ui "$xml" || true
-    if grep -q "text=\"${label}\"" "$xml" 2>/dev/null; then
+  for i in 1 2 3 4 5 6 7 8; do
+    if home_shows "$label" "$xml"; then
       shot "$png"
       echo "Home screen shows ${label}"
       return 0
     fi
-    refresh_launcher
+    if [ "$i" -eq 4 ]; then
+      pin_label_to_home "$label" || true
+    fi
   done
   shot "$png"
   echo "Home screen did not show ${label}" >&2
@@ -120,14 +159,12 @@ echo "=== debug default icon ==="
 install_and_show_default "$OUT/android-home-before-debug-stencil.png" "$OUT/android-home-before-debug-stencil.xml"
 echo "=== debug change to ionic ==="
 change_icon ionic stencil
-refresh_launcher
 capture_home "Ionic" "$OUT/android-home-after-debug-ionic.png" "$OUT/android-home-after-debug-ionic.xml"
 
 APK="$RELEASE_APK"
 echo "=== release default then change to ionitron ==="
 install_and_show_default "$OUT/android-home-before-release-stencil.png" "$OUT/android-home-before-release-stencil.xml"
 change_icon ionitron stencil
-refresh_launcher
 capture_home "Ionitron" "$OUT/android-home-after-release-ionitron.png" "$OUT/android-home-after-release-ionitron.xml"
 
 echo "Android icon evidence complete"
