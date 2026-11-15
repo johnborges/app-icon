@@ -135,7 +135,9 @@ jobs:
             evidence-ios/pod-install.log
             evidence-ios/ios-evidence.log
             evidence-ios/ios-home-before-default.png
+            evidence-ios/ios-home-with-alert-ionitron.png
             evidence-ios/ios-home-after-ionitron.png
             evidence-ios/simctl-devices.txt
-            evidence-ios/simctl-tap.txt
+            evidence-ios/uitest-build.log
+            evidence-ios/uitest.log
             evidence-ios/simulator-app.txt

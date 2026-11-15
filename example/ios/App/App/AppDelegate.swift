@@ -20,13 +20,37 @@ class AppDelegate: NSObject, UIApplicationDelegate {
             return
         }
         evidenceRecord("EVIDENCE_ICON_REQUEST \(iconName)")
+        // Poll on the main actor. The previous timer closures read
+        // alternateIconName off the actor and never managed to append a line.
+        DispatchQueue.main.async {
+            Task { @MainActor in
+                self.evidencePollTick(attempt: 0)
+            }
+        }
         DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
             self.evidenceInvokeChange(iconName, attempt: 0)
         }
-        for delay in [12.0, 20.0] {
-            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
-                let current = UIApplication.shared.alternateIconName ?? "nil"
-                self.evidenceRecord("EVIDENCE_NATIVE_ICON \(current)")
+    }
+
+    @MainActor
+    private func evidencePollTick(attempt: Int) {
+        evidenceRecord("EVIDENCE_POLL_TICK \(attempt)")
+        let current = UIApplication.shared.alternateIconName ?? "nil"
+        evidenceRecord("EVIDENCE_NATIVE_ICON \(current)")
+        if let webView = evidenceBridge()?.webView {
+            webView.evaluateJavaScript(
+                "(function(){ return window.__evidenceGetName || ''; })()"
+            ) { result, _ in
+                let value = result as? String ?? ""
+                if !value.isEmpty {
+                    self.evidenceRecord("EVIDENCE_GETNAME \(value)")
+                }
+            }
+        }
+        guard attempt < 40 else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+            Task { @MainActor in
+                self.evidencePollTick(attempt: attempt + 1)
             }
         }
     }
@@ -46,8 +70,13 @@ class AppDelegate: NSObject, UIApplicationDelegate {
         (function(){
           if (!window.Capacitor || !window.Capacitor.Plugins || !window.Capacitor.Plugins.AppIcon) { return 'wait'; }
           var disable = ['ionic','stencil','ionitron'].filter(function(n){ return n !== '\(iconName)'; });
-          window.Capacitor.Plugins.AppIcon.change({name:'\(iconName)', disable: disable})
-            .then(function(){ console.log('EVIDENCE_ICON_OK'); })
+          window.Capacitor.Plugins.AppIcon.change({name:'\(iconName)', disable: disable, suppressNotification: true})
+            .then(function(){ return window.Capacitor.Plugins.AppIcon.getName(); })
+            .then(function(r){
+              var name = (r && r.value) ? String(r.value) : 'nil';
+              window.__evidenceGetName = name;
+              console.log('EVIDENCE_GETNAME ' + name);
+            })
             .catch(function(e){ console.log('EVIDENCE_ICON_ERR ' + (e && e.message ? e.message : e)); });
           return 'called';
         })()
@@ -63,10 +92,6 @@ class AppDelegate: NSObject, UIApplicationDelegate {
                     self.evidenceInvokeChange(iconName, attempt: attempt + 1)
                 }
             }
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
-            let current = UIApplication.shared.alternateIconName ?? "nil"
-            self.evidenceRecord("EVIDENCE_NATIVE_ICON \(current)")
         }
     }
 

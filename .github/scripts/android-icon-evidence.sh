@@ -46,26 +46,25 @@ open_drawer() {
   sleep 2
 }
 
-# Scroll the drawer until the launcher label is on screen, then screenshot.
-capture_label() {
+# Stay on the home screen. The example's launcher alias lands in the dock.
+capture_home() {
   local label="$1"
   local png="$2"
   local xml="$3"
   local i
-  open_drawer
   for i in 1 2 3 4 5 6; do
+    adb shell input keyevent KEYCODE_HOME
+    sleep 2
     dump_ui "$xml" || true
     if grep -q "text=\"${label}\"" "$xml" 2>/dev/null; then
       shot "$png"
-      echo "Found launcher label ${label}"
+      echo "Home screen shows ${label}"
       return 0
     fi
-    read -r W H < <(screen_size)
-    adb shell input swipe $((W / 2)) $((H * 75 / 100)) $((W / 2)) $((H * 35 / 100)) 250
-    sleep 1
+    refresh_launcher
   done
   shot "$png"
-  echo "Launcher label ${label} was not in the drawer hierarchy" >&2
+  echo "Home screen did not show ${label}" >&2
   return 1
 }
 
@@ -89,7 +88,7 @@ install_and_show_default() {
   adb shell am start -n com.example.app/.stencil
   sleep 4
   refresh_launcher
-  capture_label "Stencil" "$png" "$xml"
+  capture_home "Stencil" "$png" "$xml"
   resolve_launcher | tee "${png%.png}.resolve.txt"
 }
 
@@ -118,18 +117,18 @@ change_icon() {
 
 APK="$DEBUG_APK"
 echo "=== debug default icon ==="
-install_and_show_default "$OUT/android-launcher-before-default-stencil.png" "$OUT/android-launcher-before-default-stencil.xml"
+install_and_show_default "$OUT/android-home-before-debug-stencil.png" "$OUT/android-home-before-debug-stencil.xml"
 echo "=== debug change to ionic ==="
 change_icon ionic stencil
 refresh_launcher
-capture_label "Ionic" "$OUT/android-launcher-after-debug-ionic.png" "$OUT/android-launcher-after-debug-ionic.xml"
+capture_home "Ionic" "$OUT/android-home-after-debug-ionic.png" "$OUT/android-home-after-debug-ionic.xml"
 
 APK="$RELEASE_APK"
 echo "=== release default then change to ionitron ==="
-install_and_show_default "$OUT/android-launcher-before-release-stencil.png" "$OUT/android-launcher-before-release-stencil.xml"
+install_and_show_default "$OUT/android-home-before-release-stencil.png" "$OUT/android-home-before-release-stencil.xml"
 change_icon ionitron stencil
 refresh_launcher
-capture_label "Ionitron" "$OUT/android-launcher-after-release-ionitron.png" "$OUT/android-launcher-after-release-ionitron.xml"
+capture_home "Ionitron" "$OUT/android-home-after-release-ionitron.png" "$OUT/android-home-after-release-ionitron.xml"
 
 echo "Android icon evidence complete"
 ls -lh "$OUT"
