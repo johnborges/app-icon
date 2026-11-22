@@ -62,7 +62,7 @@ public class MainActivity extends BridgeActivity {
             return;
         }
         String icon = intent.getStringExtra("evidenceIcon");
-        if (!"change".equals(action) && !"reset".equals(action)) {
+        if (!"change".equals(action) && !"reset".equals(action) && !"getname".equals(action)) {
             Log.e(TAG, "REJECT action=" + action);
             return;
         }
@@ -84,7 +84,14 @@ public class MainActivity extends BridgeActivity {
             retry(action, icon, attempt, "bridge-not-ready");
             return;
         }
-        String js = "change".equals(action) ? changeJs(icon) : resetJs();
+        String js;
+        if ("change".equals(action)) {
+            js = changeJs(icon);
+        } else if ("reset".equals(action)) {
+            js = resetJs();
+        } else {
+            js = getNameJs();
+        }
         getBridge().eval(js, (ValueCallback<String>) value -> {
             Log.i(TAG, "EVAL " + action + " " + value + " pid=" + Process.myPid());
             if (value != null && value.contains("wait")) {
@@ -107,8 +114,7 @@ public class MainActivity extends BridgeActivity {
             + "var disable=['ionic','stencil','ionitron'].filter(function(n){return n!=='" + icon + "';});"
             + "console.log('AI66_CHANGE_CALL name=" + icon + " disable='+disable.join(','));"
             + "window.Capacitor.Plugins.AppIcon.change({name:'" + icon + "',suppressNotification:true,disable:disable})"
-            + ".then(function(){console.log('AI66_CHANGE_OK');return window.Capacitor.Plugins.AppIcon.getName();})"
-            + ".then(function(r){console.log('AI66_GETNAME_AFTER_CHANGE '+JSON.stringify(r));})"
+            + ".then(function(){console.log('AI66_CHANGE_OK');})"
             + ".catch(function(e){console.log('AI66_CHANGE_ERR '+(e&&e.message?e.message:e));});"
             + "return 'called';"
             + "})()";
@@ -119,9 +125,22 @@ public class MainActivity extends BridgeActivity {
             + "if(!window.Capacitor||!window.Capacitor.Plugins||!window.Capacitor.Plugins.AppIcon){return 'wait';}"
             + "console.log('AI66_RESET_CALL disable=ionic,stencil,ionitron');"
             + "window.Capacitor.Plugins.AppIcon.reset({suppressNotification:true,disable:['ionic','stencil','ionitron']})"
-            + ".then(function(){console.log('AI66_RESET_OK');return window.Capacitor.Plugins.AppIcon.getName();})"
-            + ".then(function(r){console.log('AI66_GETNAME_AFTER_RESET '+JSON.stringify(r));})"
+            + ".then(function(){console.log('AI66_RESET_OK');})"
             + ".catch(function(e){console.log('AI66_RESET_ERR '+(e&&e.message?e.message:e));});"
+            + "return 'called';"
+            + "})()";
+    }
+
+    // Separate from reset so a null launch intent cannot kill the process
+    // before the reset captures are on disk. The NPE, when it happens, is
+    // its own finding.
+    private String getNameJs() {
+        return "(function(){"
+            + "if(!window.Capacitor||!window.Capacitor.Plugins||!window.Capacitor.Plugins.AppIcon){return 'wait';}"
+            + "console.log('AI66_GETNAME_CALL');"
+            + "window.Capacitor.Plugins.AppIcon.getName()"
+            + ".then(function(r){console.log('AI66_GETNAME_RESULT '+JSON.stringify(r));})"
+            + ".catch(function(e){console.log('AI66_GETNAME_ERR '+(e&&e.message?e.message:e));});"
             + "return 'called';"
             + "})()";
     }
