@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# Issue 66 evidence. Calls AppIcon.change then AppIcon.reset on the example app
-# and saves logcat, dumpsys, launcher queries, and screenshots. Does not decide
-# whether the bug reproduced; it only records what the device did.
+# Issue 66 evidence. After AppIcon.change, leave the app in the foreground for
+# 30s with no HOME, am start, or other input, and sample pid, the resumed
+# activity, and a screenshot at +2/+5/+10/+15/+20/+30s. Launcher queries and
+# reset happen only after that window. getName is a later, separate call.
+# Does not decide whether the bug reproduced; it only records what the device did.
 set -u
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -108,14 +110,80 @@ print("\n".join(lines))
 PY
 }
 
+capture_resumed() {
+  local name="$1"
+  adb shell dumpsys activity activities > "$OUT/dumpsys-activities-$name.txt" || true
+  grep -E "topResumedActivity=|ResumedActivity:" \
+    "$OUT/dumpsys-activities-$name.txt" > "$OUT/resumed-$name.txt" || true
+}
+
 capture_phase() {
   local name="$1"
   save_pid "$name"
   shot "$OUT/screen-$name.png"
-  adb shell dumpsys activity activities > "$OUT/dumpsys-activities-$name.txt" || true
-  grep -E "ResumedActivity|topResumedActivity|mResumedActivity|lastPausedActivity|realActivity=|com.example.app" \
-    "$OUT/dumpsys-activities-$name.txt" > "$OUT/dumpsys-activities-$name.excerpt.txt" || true
+  capture_resumed "$name"
   launcher_queries "$name"
+}
+
+# Foreground sample. Reads only: screencap, pidof, dumpsys. No keys, no broadcasts.
+capture_foreground() {
+  local offset="$1"
+  local name="plus-$offset"
+  local now pid resumed
+  now="$(adb shell date '+%m-%d %H:%M:%S' | tr -d '\r')"
+  save_pid "$name"
+  pid="$(cat "$OUT/pid-$name.txt")"
+  shot "$OUT/screen-$name.png"
+  capture_resumed "$name"
+  resumed="$(paste -sd ' | ' "$OUT/resumed-$name.txt" 2>/dev/null || true)"
+  printf 'capture +%ss device=%s pid=%s resumed=%s\n' "$offset" "$now" "${pid:-<none>}" "${resumed:-<none>}" | tee -a "$OUT/timeline.txt"
+}
+
+device_now_ms() {
+  adb shell date '+%s %N' | tr -d '\r' | python3 -c 'import sys; p=sys.stdin.read().split(); n=(p[1]+"000")[:3] if len(p)>1 and p[1].isdigit() else "0"; print(int(p[0])*1000+int(n))'
+}
+
+# Print epoch milliseconds for a logcat timestamp "MM-DD HH:MM:SS.mmm".
+log_time_ms() {
+  python3 - "$1" <<'PY'
+import datetime, subprocess, sys
+line = sys.argv[1]
+parts = line.split()
+stamp = parts[0] + " " + parts[1]
+mon, day = stamp[:5].split("-")
+hh, mm, rest = stamp[6:].split(":")
+sec, frac = rest.split(".")
+year = subprocess.check_output(["adb", "shell", "date", "+%Y"], text=True).strip()
+z = subprocess.check_output(["adb", "shell", "date", "+%z"], text=True).strip()
+sign = 1 if z.startswith("+") else -1
+off = datetime.timedelta(hours=sign * int(z[1:3]), minutes=sign * int(z[3:5]))
+frac = (frac + "000")[:3]
+dt = datetime.datetime(int(year), int(mon), int(day), int(hh), int(mm), int(sec), int(frac) * 1000)
+epoch = (dt - off - datetime.datetime(1970, 1, 1)).total_seconds()
+print(int(round(epoch * 1000)))
+PY
+}
+
+wait_until_ms() {
+  local target="$1"
+  local now spins=0
+  while true; do
+    now="$(device_now_ms)"
+    if [ "$now" -ge "$target" ]; then
+      return 0
+    fi
+    if [ $((target - now)) -gt 60000 ]; then
+      log "clock skew: target is $((target - now))ms ahead of device; capturing now"
+      echo "WAIT_SKEW now=$now target=$target" | tee -a "$OUT/timeline.txt"
+      return 0
+    fi
+    spins=$((spins + 1))
+    if [ "$spins" -gt 200 ]; then
+      log "timed wait exceeded 40s; capturing now"
+      return 0
+    fi
+    sleep 0.2
+  done
 }
 
 screen_size() {
@@ -237,23 +305,105 @@ stdbuf -oL adb logcat -v threadtime > "$OUT/logcat-main.txt" &
 MAIN_PID=$!
 stdbuf -oL adb logcat -b events -v threadtime > "$OUT/logcat-events.txt" &
 EVENTS_PID=$!
-adb shell screenrecord --time-limit 150 /sdcard/ai66.mp4 > "$OUT/screenrecord-start.txt" 2>&1 &
+adb shell screenrecord --time-limit 180 /sdcard/ai66.mp4 > "$OUT/screenrecord-start.txt" 2>&1 &
 sleep 1
 
+: > "$OUT/timeline.txt"
 log "broadcast change"
 broadcast change ionic | tee "$OUT/broadcast-change.txt" || true
 if ! wait_log "REQUEST change:ionic" 12; then
   log "broadcast did not deliver; falling back to am start on the running alias"
+  echo "fallback_am_start_before_window" | tee -a "$OUT/timeline.txt"
   adb shell am start -n "$PKG/.stencil" --es evidenceAction change --es evidenceIcon ionic > "$OUT/am-start-change-fallback.txt" || true
   wait_log "REQUEST change:ionic" 12 || true
 fi
-wait_log "EVAL change" 20 || true
-sleep 4
-capture_phase "after-change"
-PID_AFTER_CHANGE="$(pidof_pkg)"
+wait_log "AI66_CHANGE_OK" 25 || wait_log "AI66_CHANGE_CALL" 5 || wait_log "EVAL change" 5 || true
 
+ANCHOR_LINE="$(adb logcat -d -b main -b system -b crash -v threadtime | grep -F "AI66_CHANGE_OK" | head -1 || true)"
+ANCHOR_KIND="CHANGE_OK"
+if [ -z "$ANCHOR_LINE" ]; then
+  ANCHOR_LINE="$(adb logcat -d -b main -b system -b crash -v threadtime | grep -F "AI66_CHANGE_CALL" | head -1 || true)"
+  ANCHOR_KIND="CHANGE_CALL"
+fi
+if [ -z "$ANCHOR_LINE" ]; then
+  ANCHOR_LINE="$(adb logcat -d -b main -b system -b crash -v threadtime | grep -F "EVAL change" | head -1 || true)"
+  ANCHOR_KIND="EVAL_CHANGE"
+fi
+printf 'anchor kind=%s line=%s\n' "$ANCHOR_KIND" "$ANCHOR_LINE" | tee -a "$OUT/timeline.txt"
+printf '%s\n' "$ANCHOR_LINE" > "$OUT/anchor-line.txt"
+
+if [ -n "$ANCHOR_LINE" ]; then
+  ANCHOR_MS="$(log_time_ms "$ANCHOR_LINE")"
+  echo "anchor_ms=$ANCHOR_MS" | tee -a "$OUT/timeline.txt"
+  for offset in 2 5 10 15 20 30; do
+    wait_until_ms $((ANCHOR_MS + offset * 1000))
+    capture_foreground "$offset"
+  done
+else
+  log "no change anchor; capturing once without a timed window"
+  echo "NO_ANCHOR" | tee -a "$OUT/timeline.txt"
+  capture_foreground "0"
+fi
+
+python3 - "$OUT" <<'PY' || true
+import pathlib, re, sys
+out = pathlib.Path(sys.argv[1])
+anchor = (out / "anchor-line.txt").read_text(errors="replace").strip()
+m = re.match(r"(\d\d-\d\d \d\d:\d\d:\d\d\.\d+)", anchor)
+anchor_s = m.group(1) if m else ""
+def to_ms(stamp):
+    # Compare within the same minute-scale by parsing to seconds-of-day plus millis.
+    mmdd, hms = stamp.split(" ")
+    hh, mi, rest = hms.split(":")
+    sec, frac = rest.split(".")
+    return ((int(hh) * 60 + int(mi)) * 60 + int(sec)) * 1000 + int((frac + "000")[:3])
+lines = ["== finish/kill for com.example.app in the 30s foreground window =="]
+if not anchor_s:
+    lines.append("no anchor")
+else:
+    start = to_ms(anchor_s)
+    end = start + 30000
+    seen = set()
+    interesting = ("wm_finish_activity", "am_kill", "am_proc_died", "am_finish_activity", "Force finishing")
+    blobs = []
+    for name in ("logcat-events.txt", "logcat-main.txt"):
+        p = out / name
+        if p.exists():
+            blobs.append(p.read_text(errors="replace"))
+    # Streamed logs can lag; also read the live buffer.
+    import subprocess
+    live = subprocess.check_output(["adb", "logcat", "-d", "-v", "threadtime", "-b", "main", "-b", "system", "-b", "crash", "-b", "events"], text=True, errors="replace")
+    blobs.append(live)
+    for blob in blobs:
+        for line in blob.splitlines():
+            if "com.example.app" not in line and "Force finishing" not in line:
+                continue
+            if not any(tok in line for tok in interesting):
+                continue
+            tm = re.match(r"(\d\d-\d\d \d\d:\d\d:\d\d\.\d+)", line)
+            if not tm:
+                continue
+            delta = to_ms(tm.group(1)) - start
+            if delta < -500 or delta > 31000:
+                continue
+            key = (tm.group(1), line.split(":", 2)[-1] if False else line[20:])
+            if line in seen:
+                continue
+            seen.add(line)
+            lines.append(f"+{delta/1000:.3f}s {line}")
+    if len(lines) == 1:
+        lines.append("none")
+text = "\n".join(lines) + "\n"
+(out / "foreground-events.txt").write_text(text)
+print(text)
+PY
+cat "$OUT/foreground-events.txt" >> "$OUT/timeline.txt" || true
+
+# Launcher queries and home only after the 30s foreground window.
+launcher_queries "after-change"
 home_shot "Ionic" "$OUT/screen-home-after-change.png" "$OUT/ui-home-after-change.xml" || true
 launcher_queries "home-after-change"
+PID_AFTER_CHANGE="$(pidof_pkg)"
 
 PID_BEFORE_RESET="$(pidof_pkg)"
 if [ -n "$PID_BEFORE_RESET" ]; then
@@ -267,13 +417,31 @@ if [ -n "$PID_BEFORE_RESET" ]; then
       adb shell am start -n "$PKG/.ionic" --es evidenceAction reset > "$OUT/am-start-reset-fallback.txt" || true
     wait_log "REQUEST reset:" 12 || true
   fi
-  wait_log "EVAL reset" 20 || true
+  wait_log "AI66_RESET_OK" 25 || wait_log "EVAL reset" 10 || true
   sleep 4
   capture_phase "after-reset"
   home_shot "Stencil" "$OUT/screen-home-after-reset.png" "$OUT/ui-home-after-reset.xml" || true
   launcher_queries "home-after-reset"
+  # getName is after the reset captures. A null launch intent NPEs in
+  # AppIconBase.getName and can kill the process; that stack is separate.
+  log "getName after reset captures"
+  broadcast getname | tee "$OUT/broadcast-getname.txt" || true
+  wait_log "AI66_GETNAME_CALL" 20 || true
+  sleep 3
+  adb logcat -d -v threadtime -b main -b system -b crash > "$OUT/getname-logcat.txt" || true
+  python3 - "$OUT/getname-logcat.txt" "$OUT/getname-stack.txt" <<'PY' || true
+import pathlib, sys
+text = pathlib.Path(sys.argv[1]).read_text(errors="replace").splitlines()
+start = 0
+for i, line in enumerate(text):
+    if "AI66_GETNAME_CALL" in line or "Fatal signal" in line or "FATAL EXCEPTION" in line:
+        start = i
+keys = ("AI66_GETNAME", "AndroidRuntime", "FATAL EXCEPTION", "NullPointerException", "AppIconBase.java", "Force finishing", "am_crash", "am_proc_died")
+kept = [line for line in text[max(0, start - 5):] if any(k in line for k in keys)]
+pathlib.Path(sys.argv[2]).write_text("\n".join(kept) + ("\n" if kept else "no getName lines\n"))
+PY
 else
-  log "process gone after change; not relaunching for reset"
+  log "process gone after the foreground window; not relaunching for reset"
   echo "SKIPPED process dead after change" > "$OUT/reset-skipped.txt"
   shot "$OUT/screen-after-reset-skipped.png"
 fi
