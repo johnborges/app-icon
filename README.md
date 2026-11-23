@@ -14,7 +14,18 @@
   <a href="https://www.npmjs.com/package/@capacitor-community/app-icon"><img src="https://img.shields.io/badge/all_contributors-2-orange.svg?style=flat-square" /></a>
 </p>
 
-<p align="center"><img src="https://github.com/capacitor-community/app-icon/blob/main/media/appicon_demo.gif" width="278px" height="650px" /> <img src="https://github.com/capacitor-community/app-icon/blob/main/media/appicon_demo_android.gif" width="250px" height="650px" /></p>
+<p align="center">
+  <img
+    src="https://github.com/capacitor-community/app-icon/blob/main/media/appicon_demo.gif"
+    width="278px"
+    height="650px"
+  />{' '}
+  <img
+    src="https://github.com/capacitor-community/app-icon/blob/main/media/appicon_demo_android.gif"
+    width="250px"
+    height="650px"
+  />
+</p>
 
 ## Maintainers
 
@@ -93,11 +104,15 @@ Each alternate icon is represented by an [`<activity-alias>`](https://developer.
             <category android:name="android.intent.category.LAUNCHER" />
         </intent-filter>
     </activity-alias>
-  
+
   <!-- additional <activity-alias> -->
 
 <application>
 ```
+
+`MainActivity` must not declare `android.intent.category.LAUNCHER`. Put that category on `<activity-alias>` entries only, and ship exactly one alias with `android:enabled="true"`. That alias is the default icon.
+
+`change()` enables the requested alias, recreates the activity through that alias, then disables the other aliases. `reset()` sets each alias back to its manifest `android:enabled` value and recreates the activity through the default alias when the current alias would be disabled. Neither method enables or disables `MainActivity`. The recreated activity loads a fresh WebView, so in-memory web state is discarded.
 
 ## iOS Configuration
 
@@ -136,7 +151,7 @@ const getName = async () => {
 }
 
 const resetIcon = async () => {
-  const disable: string[] = ['stencil']; // all added aliaces names 
+  const disable: string[] = ['stencil']; // all added aliaces names
   await AppIcon.reset({ suppressNotification: true, disable });
 }
 ```
@@ -177,7 +192,9 @@ Checks if changing the app icon is supported. (iOS only)
 getName() => Promise<{ value: string | null; }>
 ```
 
-Gets the name of currently set alternate icon. If original icon is set, returns null.
+Gets the name of the currently set alternate icon.
+
+On iOS, returns null when the original icon is set. On Android, returns the enabled launcher activity-alias, or null when no launcher entry can be resolved. It does not throw when the package has no launch intent.
 
 **Returns:** <code>Promise&lt;{ value: string | null; }&gt;</code>
 
@@ -192,7 +209,9 @@ Gets the name of currently set alternate icon. If original icon is set, returns 
 change(options: IconOptions) => Promise<void>
 ```
 
-Changes app icon to specified alternate.
+Changes the app icon to the specified alternate.
+
+On Android, enables that activity-alias, recreates the activity through it, then disables the other aliases. MainActivity is left unchanged. The WebView reloads.
 
 | Param         | Type                                                |
 | ------------- | --------------------------------------------------- |
@@ -209,7 +228,9 @@ Changes app icon to specified alternate.
 reset(options: ResetOptions) => Promise<void>
 ```
 
-Reverts app icon to original.
+Reverts the app icon to the original.
+
+On Android, restores each named activity-alias to its manifest enabled state and does not enable MainActivity as a launcher. The activity is recreated through the default alias when that change disables the current one, and the WebView reloads.
 
 | Param         | Type                                                  |
 | ------------- | ----------------------------------------------------- |

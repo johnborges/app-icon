@@ -5,6 +5,7 @@ import com.getcapacitor.Plugin;
 import com.getcapacitor.PluginCall;
 import com.getcapacitor.PluginMethod;
 import com.getcapacitor.annotation.CapacitorPlugin;
+import org.json.JSONObject;
 
 @CapacitorPlugin(name = "AppIcon")
 public class AppIconPlugin extends Plugin {
@@ -26,7 +27,12 @@ public class AppIconPlugin extends Plugin {
     @PluginMethod()
     public void getName(PluginCall call) {
         JSObject r = new JSObject();
-        r.put("value", implementation.getName());
+        String name = implementation.getName();
+        if (name == null) {
+            r.put("value", JSONObject.NULL);
+        } else {
+            r.put("value", name);
+        }
         call.resolve(r);
     }
 
