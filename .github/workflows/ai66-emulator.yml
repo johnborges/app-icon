@@ -35,7 +35,9 @@ jobs:
       - name: Confirm fix sources
         if: matrix.variant == 'fix'
         run: |
-          grep -q "relaunched component" android/src/main/java/com/mycompany/plugins/example/AppIconBase.java
+          grep -q "deferred disable until background" android/src/main/java/com/mycompany/plugins/example/AppIconBase.java
+          grep -q "deferred manifest restore until background" android/src/main/java/com/mycompany/plugins/example/AppIconBase.java
+          grep -q "MATCH_DISABLED_COMPONENTS" android/src/main/java/com/mycompany/plugins/example/AppIconBase.java
           grep -q '<!-- <category android:name="android.intent.category.LAUNCHER" /> -->' example/android/app/src/main/AndroidManifest.xml
 
       - name: Set up Node.js 24

@@ -6,42 +6,47 @@ import android.app.Application;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
+import android.content.pm.ActivityInfo;
+import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
-import android.content.res.XmlResourceParser;
 import android.os.Bundle;
-import android.os.Handler;
-import android.os.Looper;
 import android.util.Log;
 import com.getcapacitor.JSArray;
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import org.json.JSONException;
-import org.xmlpull.v1.XmlPullParser;
 
 public class AppIconBase {
 
     private static final String TAG = "AppIconBase";
-    private static final String ANDROID_NS = "http://schemas.android.com/apk/res/android";
+    private static final String PREFS = "com.mycompany.plugins.example.AppIcon";
+    private static final String KEY_MODE = "pending_mode";
+    private static final String KEY_KEEP = "pending_keep";
+    private static final String KEY_NAMES = "pending_names";
+    private static final String MODE_DISABLE = "disable";
+    private static final String MODE_DEFAULTS = "defaults";
     private static final Object LOCK = new Object();
-    private static Pending pending;
-    private static Application.ActivityLifecycleCallbacks callbacks;
-    private static Application pendingApp;
-    private static PackageManager pendingPm;
-    private static String pendingPackageName;
-    private static int relaunchedIdentity;
-    private static boolean relaunchReady;
+    private static boolean callbacksRegistered;
+    private static boolean applying;
 
-    private final Activity activity;
     private final Context context;
     private final String packageName;
     private final PackageManager pm;
 
     public AppIconBase(Activity activity, Context context) {
-        this.activity = activity;
-        this.context = context;
-        this.packageName = context.getPackageName();
-        this.pm = context.getApplicationContext().getPackageManager();
+        Context source = activity != null ? activity : context;
+        this.context = source;
+        this.packageName = source.getPackageName();
+        this.pm = source.getApplicationContext().getPackageManager();
+        registerStopCallback(source);
+        // Process death before onStop leaves the pending disable on disk.
+        applyPending(source, "next-start");
     }
 
     public Boolean isSupported() {
@@ -77,19 +82,19 @@ public class AppIconBase {
     }
 
     public void change(String enableName, JSArray disableNames) {
-        // Enable the new alias and relaunch through it before disabling the old
-        // ones. The resumed activity then belongs to an enabled component, so
-        // Android does not finish it for disabled-package, and one launcher remains.
-        // MainActivity is never enabled or disabled; it is not a launcher.
-        if (enableName == null || enableName.isEmpty() || "MainActivity".equals(enableName)) {
+        // The alias that owns the resumed task is still enabled. Disabling it
+        // finishes that activity (disabled-package) even with DONT_KILL_APP, so
+        // the old aliases stay up until the host activity stops. No relaunch.
+        if (isMainActivity(enableName)) {
             Log.e(TAG, "refusing icon name " + enableName);
             return;
         }
         try {
             List<String> names = stringList(disableNames);
-            setState(enableName, PackageManager.COMPONENT_ENABLED_STATE_ENABLED);
+            setState(pm, packageName, enableName, PackageManager.COMPONENT_ENABLED_STATE_ENABLED);
             Log.i(TAG, "enabled " + enableName);
-            relaunchThenApply(enableName, names, false);
+            savePending(MODE_DISABLE, enableName, names);
+            Log.i(TAG, "deferred disable until background keep=" + enableName);
         } catch (JSONException ex) {
             Log.e(TAG, "change failed to read disable list", ex);
         }
@@ -98,150 +103,288 @@ public class AppIconBase {
     public void reset(JSArray disableNames) {
         try {
             List<String> names = stringList(disableNames);
-            String defaultAlias = manifestDefaultLauncherAlias();
-            String current = shortName(currentLauncher());
-            Log.i(TAG, "reset default=" + defaultAlias + " current=" + current);
-            if (defaultAlias == null || "MainActivity".equals(defaultAlias)) {
-                Log.e(TAG, "no manifest default launcher alias; leaving the current launcher enabled");
-                for (String value : names) {
-                    if (value == null || value.isEmpty() || "MainActivity".equals(value) || value.equals(current)) {
-                        continue;
+            List<LauncherAlias> launchers = queryLauncherAliases();
+            String defaultAlias = null;
+            String current = null;
+            int manifestDefaults = 0;
+            for (LauncherAlias launcher : launchers) {
+                if (launcher.manifestEnabled) {
+                    manifestDefaults += 1;
+                    if (defaultAlias == null) {
+                        defaultAlias = launcher.alias;
                     }
-                    setState(value, PackageManager.COMPONENT_ENABLED_STATE_DEFAULT);
                 }
+                if (launcher.currentlyEnabled && current == null) {
+                    current = launcher.alias;
+                }
+            }
+            Log.i(TAG, "reset default=" + defaultAlias + " current=" + current + " manifestDefaults=" + manifestDefaults);
+            if (isMainActivity(defaultAlias)) {
+                Log.e(TAG, "no manifest default launcher alias; leaving component state unchanged");
                 return;
             }
-            setState(defaultAlias, PackageManager.COMPONENT_ENABLED_STATE_ENABLED);
-            if (defaultAlias.equals(current)) {
-                restoreDefaults(names, defaultAlias);
-                return;
-            }
-            relaunchThenApply(defaultAlias, names, true);
+            setState(pm, packageName, defaultAlias, PackageManager.COMPONENT_ENABLED_STATE_ENABLED);
+            Log.i(TAG, "enabled " + defaultAlias);
+            savePending(MODE_DEFAULTS, defaultAlias, names);
+            Log.i(TAG, "deferred manifest restore until background keep=" + defaultAlias);
         } catch (JSONException ex) {
             Log.e(TAG, "reset failed to read disable list", ex);
         }
     }
 
-    private void relaunchThenApply(String alias, List<String> names, boolean restoreDefaults) {
-        Application app = (Application) context.getApplicationContext();
+    private void savePending(String mode, String keep, List<String> names) {
+        SharedPreferences prefs = prefs(context);
+        Set<String> stored = new HashSet<>();
+        for (String name : names) {
+            if (!isMainActivity(name)) {
+                stored.add(name);
+            }
+        }
         synchronized (LOCK) {
-            clearCallbacksLocked(app);
-            pending = new Pending(names, alias, restoreDefaults);
-            relaunchedIdentity = 0;
-            relaunchReady = false;
-            pendingApp = app;
-            pendingPm = pm;
-            pendingPackageName = packageName;
-            callbacks = new RelaunchWatcher();
-            app.registerActivityLifecycleCallbacks(callbacks);
+            prefs.edit().putString(KEY_MODE, mode).putString(KEY_KEEP, keep).putStringSet(KEY_NAMES, stored).commit();
+        }
+    }
+
+    private static void registerStopCallback(Context context) {
+        Context appContext = context.getApplicationContext();
+        if (!(appContext instanceof Application)) {
+            Log.e(TAG, "no application to watch for background");
+            return;
+        }
+        synchronized (LOCK) {
+            if (callbacksRegistered) {
+                return;
+            }
+            ((Application) appContext).registerActivityLifecycleCallbacks(new StopCallback());
+            callbacksRegistered = true;
+        }
+    }
+
+    static void applyPending(Context context, String reason) {
+        if (context == null) {
+            return;
+        }
+        SharedPreferences prefs = prefs(context);
+        String mode;
+        String keep;
+        List<String> names;
+        synchronized (LOCK) {
+            if (applying) {
+                return;
+            }
+            mode = prefs.getString(KEY_MODE, null);
+            if (mode == null) {
+                return;
+            }
+            applying = true;
+            keep = prefs.getString(KEY_KEEP, "");
+            Set<String> stored = prefs.getStringSet(KEY_NAMES, new HashSet<String>());
+            names = new ArrayList<>();
+            if (stored != null) {
+                names.addAll(stored);
+            }
         }
         try {
-            startAlias(alias);
-        } catch (RuntimeException ex) {
-            Log.e(TAG, "relaunch failed; not disabling the running alias", ex);
+            String packageName = context.getPackageName();
+            PackageManager manager = context.getPackageManager();
+            Log.i(
+                TAG,
+                "applying deferred alias update reason=" +
+                    reason +
+                    " mode=" +
+                    mode +
+                    " keep=" +
+                    keep +
+                    " names=" +
+                    names
+            );
+            if (MODE_DEFAULTS.equals(mode)) {
+                if (!isMainActivity(keep)) {
+                    setState(manager, packageName, keep, PackageManager.COMPONENT_ENABLED_STATE_ENABLED);
+                }
+                for (String name : names) {
+                    if (isMainActivity(name) || name.equals(keep)) {
+                        continue;
+                    }
+                    setState(manager, packageName, name, PackageManager.COMPONENT_ENABLED_STATE_DEFAULT);
+                    Log.i(TAG, "defaulted " + name);
+                }
+                if (!isMainActivity(keep)) {
+                    setState(manager, packageName, keep, PackageManager.COMPONENT_ENABLED_STATE_DEFAULT);
+                    Log.i(TAG, "defaulted " + keep);
+                }
+            } else {
+                for (String name : names) {
+                    if (isMainActivity(name) || name.equals(keep)) {
+                        continue;
+                    }
+                    setState(manager, packageName, name, PackageManager.COMPONENT_ENABLED_STATE_DISABLED);
+                    Log.i(TAG, "disabled " + name);
+                }
+            }
             synchronized (LOCK) {
-                pending = null;
-                clearCallbacksLocked(app);
+                prefs.edit().remove(KEY_MODE).remove(KEY_KEEP).remove(KEY_NAMES).commit();
             }
-            return;
-        }
-        scheduleCheck(app, 0);
-    }
-
-    private static void scheduleCheck(Application app, int attempt) {
-        new Handler(Looper.getMainLooper()).postDelayed(
-            () -> {
-                boolean ready;
-                synchronized (LOCK) {
-                    ready = relaunchReady;
-                    if (pending == null) {
-                        return;
-                    }
-                }
-                if (ready) {
-                    applyPending("timer-after-resume");
-                    return;
-                }
-                if (attempt >= 5) {
-                    Log.e(TAG, "relaunch did not resume the new alias; leaving the running alias enabled");
-                    synchronized (LOCK) {
-                        pending = null;
-                        clearCallbacksLocked(app);
-                    }
-                    return;
-                }
-                scheduleCheck(app, attempt + 1);
-            },
-            300
-        );
-    }
-
-    private static void applyPending(String reason) {
-        Pending action;
-        PackageManager manager;
-        String pkg;
-        synchronized (LOCK) {
-            action = pending;
-            pending = null;
-            manager = pendingPm;
-            pkg = pendingPackageName;
-            clearCallbacksLocked(pendingApp);
-        }
-        if (action == null || manager == null || pkg == null) {
-            return;
-        }
-        Log.i(TAG, "apply alias state reason=" + reason + " keep=" + action.keepAlias + " restore=" + action.restoreDefaults);
-        if (action.restoreDefaults) {
-            restoreDefaults(manager, pkg, action.names, action.keepAlias);
-        } else {
-            disableOthers(manager, pkg, action.names, action.keepAlias);
-        }
-    }
-
-    private static void disableOthers(PackageManager manager, String pkg, List<String> names, String keepAlias) {
-        for (String value : names) {
-            if (value == null || value.isEmpty() || "MainActivity".equals(value) || value.equals(keepAlias)) {
-                continue;
+        } catch (RuntimeException ex) {
+            Log.e(TAG, "deferred alias update failed reason=" + reason, ex);
+        } finally {
+            synchronized (LOCK) {
+                applying = false;
             }
-            setState(manager, pkg, value, PackageManager.COMPONENT_ENABLED_STATE_DISABLED);
-            Log.i(TAG, "disabled " + value);
         }
-    }
-
-    private void restoreDefaults(List<String> names, String defaultAlias) {
-        restoreDefaults(pm, packageName, names, defaultAlias);
-    }
-
-    private static void restoreDefaults(PackageManager manager, String pkg, List<String> names, String defaultAlias) {
-        for (String value : names) {
-            if (value == null || value.isEmpty() || "MainActivity".equals(value)) {
-                continue;
-            }
-            setState(manager, pkg, value, PackageManager.COMPONENT_ENABLED_STATE_DEFAULT);
-            Log.i(TAG, "defaulted " + value);
-        }
-        if (defaultAlias != null && !"MainActivity".equals(defaultAlias)) {
-            setState(manager, pkg, defaultAlias, PackageManager.COMPONENT_ENABLED_STATE_DEFAULT);
-            Log.i(TAG, "defaulted " + defaultAlias);
-        }
-    }
-
-    private void setState(String alias, int state) {
-        setState(pm, packageName, alias, state);
     }
 
     private static void setState(PackageManager manager, String pkg, String alias, int state) {
-        manager.setComponentEnabledSetting(new ComponentName(pkg, pkg + "." + alias), state, PackageManager.DONT_KILL_APP);
+        if (isMainActivity(alias)) {
+            Log.e(TAG, "refusing to change MainActivity");
+            return;
+        }
+        manager.setComponentEnabledSetting(
+            new ComponentName(pkg, pkg + "." + alias),
+            state,
+            PackageManager.DONT_KILL_APP
+        );
     }
 
-    private void startAlias(String alias) {
-        ComponentName component = new ComponentName(packageName, packageName + "." + alias);
-        Intent intent = new Intent(Intent.ACTION_MAIN);
-        intent.setComponent(component);
-        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK | Intent.FLAG_ACTIVITY_NO_ANIMATION);
-        Context launchContext = activity != null ? activity : context.getApplicationContext();
-        launchContext.startActivity(intent);
-        Log.i(TAG, "relaunched component=" + component.flattenToShortString());
+    @SuppressLint("QueryPermissionsNeeded")
+    private List<LauncherAlias> queryLauncherAliases() {
+        Map<String, ActivityInfo> byName = new HashMap<>();
+        int packageActivities = 0;
+        try {
+            PackageInfo info = packageInfo();
+            if (info.activities != null) {
+                packageActivities = info.activities.length;
+                for (ActivityInfo activityInfo : info.activities) {
+                    if (activityInfo == null || activityInfo.name == null) {
+                        continue;
+                    }
+                    byName.put(activityInfo.name, activityInfo);
+                    Log.i(
+                        TAG,
+                        "package activity=" +
+                            activityInfo.name +
+                            " manifestEnabled=" +
+                            activityInfo.enabled +
+                            " target=" +
+                            activityInfo.targetActivity
+                    );
+                }
+            }
+        } catch (Exception ex) {
+            Log.e(TAG, "package activity lookup failed", ex);
+        }
+
+        Map<String, ResolveInfo> resolved = new HashMap<>();
+        collectLaunchers(resolved, queryFlags(false));
+        collectLaunchers(resolved, queryFlags(true));
+        boolean sawManifestDefault = false;
+        for (Map.Entry<String, ResolveInfo> entry : resolved.entrySet()) {
+            ActivityInfo activityInfo = byName.get(entry.getKey());
+            if (activityInfo == null && entry.getValue() != null) {
+                activityInfo = entry.getValue().activityInfo;
+            }
+            if (activityInfo == null || !activityInfo.enabled) {
+                continue;
+            }
+            if (!isMainActivity(aliasFromClassName(packageName, activityInfo.name))) {
+                sawManifestDefault = true;
+            }
+        }
+        // queryIntentActivities can omit a runtime-disabled alias. The manifest
+        // default is still in getPackageInfo and is the alias reset() must restore.
+        if (!sawManifestDefault) {
+            Log.w(TAG, "query missed the manifest-enabled alias; scanning package activities");
+            for (ActivityInfo activityInfo : byName.values()) {
+                if (activityInfo.targetActivity == null || !activityInfo.enabled) {
+                    continue;
+                }
+                String alias = aliasFromClassName(packageName, activityInfo.name);
+                if (isMainActivity(alias)) {
+                    continue;
+                }
+                resolved.put(activityInfo.name, null);
+            }
+        }
+
+        List<LauncherAlias> result = new ArrayList<>();
+        for (Map.Entry<String, ResolveInfo> entry : resolved.entrySet()) {
+            String className = entry.getKey();
+            ActivityInfo fromPackage = byName.get(className);
+            ActivityInfo activityInfo = fromPackage;
+            if (activityInfo == null && entry.getValue() != null) {
+                activityInfo = entry.getValue().activityInfo;
+            }
+            if (activityInfo == null || activityInfo.name == null) {
+                continue;
+            }
+            String alias = aliasFromClassName(packageName, activityInfo.name);
+            if (isMainActivity(alias)) {
+                continue;
+            }
+            String pkg = activityInfo.packageName != null ? activityInfo.packageName : packageName;
+            int setting = pm.getComponentEnabledSetting(new ComponentName(pkg, activityInfo.name));
+            // ActivityInfo.enabled is the manifest android:enabled value.
+            // getComponentEnabledSetting is the runtime override (DEFAULT = manifest).
+            boolean manifestEnabled = activityInfo.enabled;
+            boolean currentlyEnabled =
+                setting == PackageManager.COMPONENT_ENABLED_STATE_ENABLED ||
+                (setting == PackageManager.COMPONENT_ENABLED_STATE_DEFAULT && manifestEnabled);
+            Log.i(
+                TAG,
+                "launcher alias=" +
+                    alias +
+                    " manifestEnabled=" +
+                    manifestEnabled +
+                    " setting=" +
+                    setting +
+                    " current=" +
+                    currentlyEnabled
+            );
+            result.add(new LauncherAlias(alias, manifestEnabled, currentlyEnabled));
+        }
+        Log.i(TAG, "launcher candidates=" + result.size() + " packageActivities=" + packageActivities);
+        return result;
+    }
+
+    @SuppressLint("QueryPermissionsNeeded")
+    private void collectLaunchers(Map<String, ResolveInfo> into, int flags) {
+        Intent query = new Intent(Intent.ACTION_MAIN);
+        query.addCategory(Intent.CATEGORY_LAUNCHER);
+        query.setPackage(packageName);
+        List<ResolveInfo> matches;
+        try {
+            matches = pm.queryIntentActivities(query, flags);
+        } catch (RuntimeException ex) {
+            Log.e(TAG, "queryIntentActivities failed flags=" + flags, ex);
+            return;
+        }
+        if (matches == null) {
+            return;
+        }
+        for (ResolveInfo resolve : matches) {
+            if (resolve == null || resolve.activityInfo == null || resolve.activityInfo.name == null) {
+                continue;
+            }
+            into.put(resolve.activityInfo.name, resolve);
+        }
+    }
+
+    private int queryFlags(boolean includeDisabled) {
+        int flags = PackageManager.MATCH_DIRECT_BOOT_AWARE | PackageManager.MATCH_DIRECT_BOOT_UNAWARE;
+        if (includeDisabled) {
+            flags |= PackageManager.MATCH_DISABLED_COMPONENTS;
+        }
+        return flags;
+    }
+
+    @SuppressWarnings("deprecation")
+    private PackageInfo packageInfo() throws PackageManager.NameNotFoundException {
+        int flags =
+            PackageManager.MATCH_DISABLED_COMPONENTS |
+            PackageManager.GET_ACTIVITIES |
+            PackageManager.MATCH_DIRECT_BOOT_AWARE |
+            PackageManager.MATCH_DIRECT_BOOT_UNAWARE;
+        return pm.getPackageInfo(packageName, flags);
     }
 
     @SuppressLint("QueryPermissionsNeeded")
@@ -253,7 +396,7 @@ public class AppIconBase {
         Intent query = new Intent(Intent.ACTION_MAIN);
         query.addCategory(Intent.CATEGORY_LAUNCHER);
         query.setPackage(packageName);
-        List<ResolveInfo> matches = pm.queryIntentActivities(query, 0);
+        List<ResolveInfo> matches = pm.queryIntentActivities(query, queryFlags(false));
         if (matches == null) {
             return null;
         }
@@ -270,83 +413,29 @@ public class AppIconBase {
         if (componentName == null) {
             return null;
         }
-        String name = componentName.getShortClassName();
-        if (name == null) {
+        return aliasFromClassName(packageName, componentName.getClassName());
+    }
+
+    private static String aliasFromClassName(String pkg, String className) {
+        if (className == null || className.isEmpty()) {
             return null;
         }
-        if (name.startsWith(".")) {
-            return name.substring(1);
+        String prefix = pkg + ".";
+        if (className.startsWith(prefix)) {
+            return className.substring(prefix.length());
         }
-        String prefix = packageName + ".";
-        if (name.startsWith(prefix)) {
-            return name.substring(prefix.length());
+        if (className.startsWith(".")) {
+            return className.substring(1);
         }
-        return name;
+        return className;
     }
 
-    private String manifestDefaultLauncherAlias() {
-        XmlResourceParser parser = null;
-        try {
-            parser = context.getAssets().openXmlResourceParser("AndroidManifest.xml");
-            boolean inAlias = false;
-            String aliasName = null;
-            boolean aliasEnabled = true;
-            boolean hasLauncher = false;
-            int event = parser.getEventType();
-            while (event != XmlPullParser.END_DOCUMENT) {
-                if (event == XmlPullParser.START_TAG) {
-                    String tag = parser.getName();
-                    if ("activity-alias".equals(tag)) {
-                        inAlias = true;
-                        aliasName = attr(parser, "name");
-                        aliasEnabled = parser.getAttributeBooleanValue(ANDROID_NS, "enabled", true);
-                        hasLauncher = false;
-                    } else if (inAlias && "category".equals(tag)) {
-                        if ("android.intent.category.LAUNCHER".equals(attr(parser, "name"))) {
-                            hasLauncher = true;
-                        }
-                    }
-                } else if (event == XmlPullParser.END_TAG && "activity-alias".equals(parser.getName())) {
-                    if (inAlias && aliasEnabled && hasLauncher) {
-                        String alias = aliasFromManifestName(aliasName);
-                        if (alias != null && !"MainActivity".equals(alias)) {
-                            return alias;
-                        }
-                    }
-                    inAlias = false;
-                }
-                event = parser.next();
-            }
-        } catch (Exception ex) {
-            Log.e(TAG, "manifest default alias lookup failed", ex);
-        } finally {
-            if (parser != null) {
-                parser.close();
-            }
-        }
-        return null;
+    private static boolean isMainActivity(String alias) {
+        return alias == null || alias.isEmpty() || "MainActivity".equals(alias);
     }
 
-    private String attr(XmlResourceParser parser, String name) {
-        String value = parser.getAttributeValue(ANDROID_NS, name);
-        if (value != null) {
-            return value;
-        }
-        return parser.getAttributeValue(null, name);
-    }
-
-    private String aliasFromManifestName(String manifestName) {
-        if (manifestName == null || manifestName.isEmpty()) {
-            return null;
-        }
-        if (manifestName.startsWith(".")) {
-            return manifestName.substring(1);
-        }
-        String prefix = packageName + ".";
-        if (manifestName.startsWith(prefix)) {
-            return manifestName.substring(prefix.length());
-        }
-        return manifestName;
+    private static SharedPreferences prefs(Context context) {
+        return context.getApplicationContext().getSharedPreferences(PREFS, Context.MODE_PRIVATE);
     }
 
     private List<String> stringList(JSArray array) throws JSONException {
@@ -362,79 +451,40 @@ public class AppIconBase {
         return names;
     }
 
-    private static void clearCallbacksLocked(Application app) {
-        if (app != null && callbacks != null) {
-            app.unregisterActivityLifecycleCallbacks(callbacks);
-        }
-        callbacks = null;
-    }
+    private static final class LauncherAlias {
 
-    private static final class Pending {
+        final String alias;
+        final boolean manifestEnabled;
+        final boolean currentlyEnabled;
 
-        final List<String> names;
-        final String keepAlias;
-        final boolean restoreDefaults;
-
-        Pending(List<String> names, String keepAlias, boolean restoreDefaults) {
-            this.names = names;
-            this.keepAlias = keepAlias;
-            this.restoreDefaults = restoreDefaults;
+        LauncherAlias(String alias, boolean manifestEnabled, boolean currentlyEnabled) {
+            this.alias = alias;
+            this.manifestEnabled = manifestEnabled;
+            this.currentlyEnabled = currentlyEnabled;
         }
     }
 
-    private static final class RelaunchWatcher implements Application.ActivityLifecycleCallbacks {
+    private static final class StopCallback implements Application.ActivityLifecycleCallbacks {
 
         @Override
-        public void onActivityCreated(Activity activity, Bundle savedInstanceState) {
-            if (!isOurPackage(activity)) {
-                return;
-            }
-            synchronized (LOCK) {
-                relaunchedIdentity = System.identityHashCode(activity);
-            }
-            ComponentName intentComponent = activity.getIntent() == null ? null : activity.getIntent().getComponent();
-            Log.i(TAG, "created component=" + activity.getComponentName() + " intentComponent=" + intentComponent);
-        }
-
-        @Override
-        public void onActivityResumed(Activity activity) {
-            if (!isOurPackage(activity)) {
-                return;
-            }
-            boolean created;
-            synchronized (LOCK) {
-                created = relaunchedIdentity != 0 && relaunchedIdentity == System.identityHashCode(activity);
-                if (created) {
-                    relaunchReady = true;
-                }
-            }
-            if (!created) {
-                return;
-            }
-            ComponentName intentComponent = activity.getIntent() == null ? null : activity.getIntent().getComponent();
-            Log.i(TAG, "resumed component=" + activity.getComponentName() + " intentComponent=" + intentComponent);
-            applyPending("onResume");
-        }
-
-        private boolean isOurPackage(Activity activity) {
+        public void onActivityStopped(Activity activity) {
             if (activity == null) {
-                return false;
+                return;
             }
-            String pkg;
-            synchronized (LOCK) {
-                pkg = pendingPackageName;
-            }
-            return pkg != null && pkg.equals(activity.getPackageName());
+            applyPending(activity, "onStop");
         }
+
+        @Override
+        public void onActivityCreated(Activity activity, Bundle savedInstanceState) {}
 
         @Override
         public void onActivityStarted(Activity activity) {}
 
         @Override
-        public void onActivityPaused(Activity activity) {}
+        public void onActivityResumed(Activity activity) {}
 
         @Override
-        public void onActivityStopped(Activity activity) {}
+        public void onActivityPaused(Activity activity) {}
 
         @Override
         public void onActivitySaveInstanceState(Activity activity, Bundle outState) {}

@@ -112,7 +112,9 @@ Each alternate icon is represented by an [`<activity-alias>`](https://developer.
 
 `MainActivity` must not declare `android.intent.category.LAUNCHER`. Put that category on `<activity-alias>` entries only, and ship exactly one alias with `android:enabled="true"`. That alias is the default icon.
 
-`change()` enables the requested alias, recreates the activity through that alias, then disables the other aliases. `reset()` sets each alias back to its manifest `android:enabled` value and recreates the activity through the default alias when the current alias would be disabled. Neither method enables or disables `MainActivity`. The recreated activity loads a fresh WebView, so in-memory web state is discarded.
+`change()` enables the requested alias immediately and does not relaunch the activity. The aliases passed in `disable` stay enabled until the host activity stops, so while the app is in the foreground the launcher can briefly show more than one icon. On stop those aliases are disabled with `PackageManager.DONT_KILL_APP`. The pending disable is stored and is applied on the next start if the process dies first. `reset()` does not parse the manifest XML. It reads launcher components from `PackageManager` (`queryIntentActivities` / `getPackageInfo` with `MATCH_DISABLED_COMPONENTS` and `GET_ACTIVITIES`), treats `ActivityInfo.enabled` as the manifest default, and uses `getComponentEnabledSetting` for the alias that is enabled right now. The default alias is enabled immediately. The others return to their manifest enabled state when the app is backgrounded, which leaves a single launcher. Neither method enables or disables `MainActivity`.
+
+The WebView is not reloaded in the foreground. The alias that launched the current task is disabled only after the app leaves the foreground, and Android then finishes that activity. The next time the app opens it starts through the alias that is still enabled and loads a fresh WebView.
 
 ## iOS Configuration
 
@@ -211,7 +213,7 @@ change(options: IconOptions) => Promise<void>
 
 Changes the app icon to the specified alternate.
 
-On Android, enables that activity-alias, recreates the activity through it, then disables the other aliases. MainActivity is left unchanged. The WebView reloads.
+On Android, enables that activity-alias immediately and does not relaunch the activity. Aliases in disable stay enabled until the host activity stops, so the launcher can briefly show more than one icon while the app is in the foreground. On stop they are disabled with DONT_KILL_APP. The pending disable is stored and applied on the next start if the process dies first. MainActivity is left unchanged. The WebView stays loaded for the rest of the foreground session. Disabling the alias that launched the current task finishes that activity in the background, so the next open loads a fresh WebView.
 
 | Param         | Type                                                |
 | ------------- | --------------------------------------------------- |
@@ -230,7 +232,7 @@ reset(options: ResetOptions) => Promise<void>
 
 Reverts the app icon to the original.
 
-On Android, restores each named activity-alias to its manifest enabled state and does not enable MainActivity as a launcher. The activity is recreated through the default alias when that change disables the current one, and the WebView reloads.
+On Android, the default alias is the manifest-enabled launcher activity-alias reported by PackageManager (ActivityInfo.enabled), and the current alias comes from getComponentEnabledSetting. The default alias is enabled immediately. Every other named alias is restored to its manifest enabled state when the host activity stops, which leaves one launcher. MainActivity is not enabled or disabled. The WebView stays loaded in the foreground. The next open loads a fresh WebView if that background restore finishes the activity.
 
 | Param         | Type                                                  |
 | ------------- | ----------------------------------------------------- |

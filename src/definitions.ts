@@ -46,7 +46,7 @@ export interface AppIconPlugin {
   /**
    * Changes the app icon to the specified alternate.
    *
-   * On Android, enables that activity-alias, recreates the activity through it, then disables the other aliases. MainActivity is left unchanged. The WebView reloads.
+   * On Android, enables that activity-alias immediately and does not relaunch the activity. Aliases in disable stay enabled until the host activity stops, so the launcher can briefly show more than one icon while the app is in the foreground. On stop they are disabled with DONT_KILL_APP. The pending disable is stored and applied on the next start if the process dies first. MainActivity is left unchanged. The WebView stays loaded for the rest of the foreground session. Disabling the alias that launched the current task finishes that activity in the background, so the next open loads a fresh WebView.
    *
    * @since 1.0.0
    */
@@ -54,7 +54,7 @@ export interface AppIconPlugin {
   /**
    * Reverts the app icon to the original.
    *
-   * On Android, restores each named activity-alias to its manifest enabled state and does not enable MainActivity as a launcher. The activity is recreated through the default alias when that change disables the current one, and the WebView reloads.
+   * On Android, the default alias is the manifest-enabled launcher activity-alias reported by PackageManager (ActivityInfo.enabled), and the current alias comes from getComponentEnabledSetting. The default alias is enabled immediately. Every other named alias is restored to its manifest enabled state when the host activity stops, which leaves one launcher. MainActivity is not enabled or disabled. The WebView stays loaded in the foreground. The next open loads a fresh WebView if that background restore finishes the activity.
    *
    * @since 1.0.0
    */

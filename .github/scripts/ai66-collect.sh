@@ -1,30 +1,46 @@
 #!/usr/bin/env bash
-# Issue 66 evidence. After AppIcon.change, and again after AppIcon.reset, leave
-# the app in the foreground for 30s with no HOME, am start, or other input.
-# Sample pid, the resumed activity, a screenshot, and the launcher entry count
-# at +2/+5/+10/+15/+20/+30s. getName is a later, separate call.
-# Does not decide whether the bug reproduced; it only records what the device did.
+# Issue 66 acceptance. After change() and again after reset(), hold the app in
+# the foreground for 30s. The run fails if the activity finishes, the launcher
+# comes to the top, getName crashes, or HOME does not leave exactly one launcher.
+# Two icons while foregrounded are measured, not judged.
 set -u
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 OUT="${EVIDENCE_DIR:-$ROOT/ai66-evidence}"
 APK="${DEBUG_APK:-$ROOT/example/android/app/build/outputs/apk/debug/app-debug.apk}"
 PKG=com.example.app
+MAIN_PID=""
+EVENTS_PID=""
 mkdir -p "$OUT"
 
 log() { echo "AI66_HOST $(date -u +%H:%M:%S) $*"; }
 
+finalize() {
+  local code=$?
+  trap - EXIT
+  if [ -n "$MAIN_PID" ]; then
+    kill "$MAIN_PID" >/dev/null 2>&1 || true
+  fi
+  if [ -n "$EVENTS_PID" ]; then
+    kill "$EVENTS_PID" >/dev/null 2>&1 || true
+  fi
+  if [ ! -f "$OUT/summary.json" ]; then
+    python3 "$ROOT/.github/scripts/ai66-score.py" "$OUT" > "$OUT/score-stdout.txt" || true
+  fi
+  if [ -f "$OUT/summary.json" ]; then
+    python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print("AI66_SUMMARY pass=%s variant=%s" % (d.get("pass"), d.get("variant")))' "$OUT/summary.json" || true
+  fi
+  exit "$code"
+}
+trap finalize EXIT
+
 shot() {
   local dest="$1"
   adb exec-out screencap -p > "$dest" || true
-  if ! cmp -s <(printf '\211PNG') <(head -c 4 "$dest" 2>/dev/null || true); then
-    log "screenshot missing png magic: $dest"
-  fi
-  ls -lh "$dest" || true
 }
 
 pidof_pkg() {
-  adb shell pidof "$PKG" 2>/dev/null | tr -d '\r' || true
+  adb shell pidof -s "$PKG" 2>/dev/null | tr -d '\r' || true
 }
 
 save_pid() {
@@ -32,217 +48,23 @@ save_pid() {
   local pid
   pid="$(pidof_pkg)"
   printf '%s\n' "$pid" > "$OUT/pid-$name.txt"
-  adb shell ps -A > "$OUT/ps-$name.txt" || true
   log "pid $name=${pid:-<none>}"
 }
 
-launcher_queries() {
-  local name="$1"
-  adb shell pm query-activities -a android.intent.action.MAIN -c android.intent.category.LAUNCHER > "$OUT/pm-query-activities-$name.txt" || true
-  adb shell cmd package query-activities -a android.intent.action.MAIN -c android.intent.category.LAUNCHER > "$OUT/cmd-query-activities-$name.txt" || true
-  adb shell cmd package resolve-activity -a android.intent.action.MAIN -c android.intent.category.LAUNCHER "$PKG" > "$OUT/resolve-activity-$name.txt" || true
-  adb shell dumpsys package "$PKG" > "$OUT/dumpsys-package-$name.txt" || true
-  python3 - "$OUT" "$name" <<'PY' || true
-import re, pathlib, sys
-out, name = sys.argv[1], sys.argv[2]
-dest = pathlib.Path(out) / f"launcher-entries-{name}.txt"
-lines = []
-for label in ("pm-query-activities", "cmd-query-activities", "resolve-activity"):
-    path = pathlib.Path(out) / f"{label}-{name}.txt"
-    text = path.read_text(errors="replace") if path.exists() else ""
-    found = re.findall(r"name=(com\.example\.app\.(?:MainActivity|stencil|ionic|ionitron))\b", text)
-    uniq = []
-    for item in found:
-        if item not in uniq:
-            uniq.append(item)
-    lines.append(f"== {label} raw={len(found)} unique={len(uniq)}")
-    lines.extend(uniq or ["<none>"])
-pkg = pathlib.Path(out) / f"dumpsys-package-{name}.txt"
-text = pkg.read_text(errors="replace") if pkg.exists() else ""
-for header in ("enabledComponents:", "disabledComponents:"):
-    lines.append(f"== {header}")
-    grabbing = False
-    got = False
-    for line in text.splitlines():
-        if header in line:
-            grabbing = True
-            continue
-        if grabbing:
-            if re.match(r"\s+com\.example\.app\.", line):
-                lines.append(line.strip())
-                got = True
-                continue
-            if got:
-                break
-            if line.strip() == "":
-                break
-            if not line.startswith(" ") and not line.startswith("\t"):
-                break
-    if not got:
-        lines.append("<none>")
-# Enabled MAIN/LAUNCHER rows in the package resolver table.
-lines.append("== resolver MAIN+LAUNCHER")
-blocks = text.split("Activity Resolver Table:")
-section = blocks[1] if len(blocks) > 1 else ""
-# Stop at the next top-level table if present.
-section = re.split(r"\n(?:Receiver|Service|Provider) Resolver Table:", section)[0]
-current = None
-chunk = []
-rows = []
-for line in section.splitlines() + [""]:
-    if re.search(r"com\.example\.app/\.", line):
-        current = line.strip()
-        chunk = [current]
-        continue
-    if current:
-        if line.strip() == "" or re.match(r"\S", line):
-            blob = "\n".join(chunk)
-            if "android.intent.category.LAUNCHER" in blob and "android.intent.action.MAIN" in blob:
-                rows.append(current)
-            current = None
-            chunk = []
-        else:
-            chunk.append(line)
-lines.append(f"count={len(rows)}")
-lines.extend(rows or ["<none>"])
-dest.write_text("\n".join(lines) + "\n")
-print("\n".join(lines))
-PY
-}
-
-capture_resumed() {
-  local name="$1"
-  adb shell dumpsys activity activities > "$OUT/dumpsys-activities-$name.txt" || true
-  grep -E "topResumedActivity=|ResumedActivity:" \
-    "$OUT/dumpsys-activities-$name.txt" > "$OUT/resumed-$name.txt" || true
-}
-
-capture_phase() {
-  local name="$1"
-  save_pid "$name"
-  shot "$OUT/screen-$name.png"
-  capture_resumed "$name"
-  launcher_queries "$name"
-}
-
-# Launcher count for com.example.app from pm query-activities MAIN/LAUNCHER.
-# Read-only; no keys and no broadcasts.
-count_launchers() {
-  local name="$1"
-  adb shell pm query-activities -a android.intent.action.MAIN -c android.intent.category.LAUNCHER > "$OUT/pm-query-activities-$name.txt" || true
-  python3 - "$OUT/pm-query-activities-$name.txt" <<'PY'
-import pathlib, re, sys
-text = pathlib.Path(sys.argv[1]).read_text(errors="replace")
-names = []
-for item in re.findall(r"name=(com\.example\.app\.(?:MainActivity|stencil|ionic|ionitron))\b", text):
-    label = "com.example.app/." + item.split(".")[-1]
-    if label not in names:
-        names.append(label)
-for item in re.findall(r"(com\.example\.app/\.(?:MainActivity|stencil|ionic|ionitron))\b", text):
-    if item not in names:
-        names.append(item)
-print(f"launchers={len(names)} [{', '.join(names) if names else 'none'}]")
-PY
-}
-
-# Foreground sample. Reads only: screencap, pidof, dumpsys, pm query. No keys, no broadcasts.
-capture_foreground() {
-  local phase="$1"
-  local offset="$2"
-  local name="${phase}-plus-${offset}"
-  local now pid resumed launchers
-  now="$(adb shell date '+%m-%d %H:%M:%S' | tr -d '\r')"
-  save_pid "$name"
-  pid="$(cat "$OUT/pid-$name.txt")"
-  shot "$OUT/screen-$name.png"
-  capture_resumed "$name"
-  resumed="$(paste -sd ' | ' "$OUT/resumed-$name.txt" 2>/dev/null || true)"
-  launchers="$(count_launchers "$name" | tail -n 1)"
-  printf '%s capture +%ss device=%s pid=%s %s resumed=%s\n' \
-    "$phase" "$offset" "$now" "${pid:-<none>}" "${launchers:-launchers=?}" "${resumed:-<none>}" | tee -a "$OUT/timeline.txt"
-}
-
-hold_foreground() {
-  local phase="$1"
-  local anchor_line anchor_ms offset
-  anchor_line="$(cat "$OUT/anchor-line-${phase}.txt" 2>/dev/null || true)"
-  if [ -n "$anchor_line" ]; then
-    anchor_ms="$(log_time_ms "$anchor_line")"
-    echo "${phase} anchor_ms=$anchor_ms" | tee -a "$OUT/timeline.txt"
-    for offset in 2 5 10 15 20 30; do
-      wait_until_ms $((anchor_ms + offset * 1000))
-      capture_foreground "$phase" "$offset"
-    done
-  else
-    log "no ${phase} anchor; capturing once without a timed window"
-    echo "NO_ANCHOR ${phase}" | tee -a "$OUT/timeline.txt"
-    capture_foreground "$phase" "0"
-  fi
-}
-
-write_window_events() {
-  local phase="$1"
-  python3 - "$OUT" "$phase" <<'PY' || true
-import pathlib, re, subprocess, sys
-out = pathlib.Path(sys.argv[1])
-phase = sys.argv[2]
-anchor_path = out / f"anchor-line-{phase}.txt"
-anchor = anchor_path.read_text(errors="replace").strip() if anchor_path.exists() else ""
-m = re.match(r"(\d\d-\d\d \d\d:\d\d:\d\d\.\d+)", anchor)
-anchor_s = m.group(1) if m else ""
-def to_ms(stamp):
-    _mmdd, hms = stamp.split(" ")
-    hh, mi, rest = hms.split(":")
-    sec, frac = rest.split(".")
-    return ((int(hh) * 60 + int(mi)) * 60 + int(sec)) * 1000 + int((frac + "000")[:3])
-lines = [f"== finish/kill for com.example.app in the {phase} 30s foreground window =="]
-if not anchor_s:
-    lines.append("no anchor")
-else:
-    start = to_ms(anchor_s)
-    seen = set()
-    interesting = ("wm_finish_activity", "am_kill", "am_proc_died", "am_finish_activity", "Force finishing")
-    blobs = []
-    for name in ("logcat-events.txt", "logcat-main.txt"):
-        p = out / name
-        if p.exists():
-            blobs.append(p.read_text(errors="replace"))
-    live = subprocess.check_output(
-        ["adb", "logcat", "-d", "-v", "threadtime", "-b", "main", "-b", "system", "-b", "crash", "-b", "events"],
-        text=True,
-        errors="replace",
-    )
-    blobs.append(live)
-    for blob in blobs:
-        for line in blob.splitlines():
-            if "com.example.app" not in line and "Force finishing" not in line:
-                continue
-            if not any(tok in line for tok in interesting):
-                continue
-            tm = re.match(r"(\d\d-\d\d \d\d:\d\d:\d\d\.\d+)", line)
-            if not tm:
-                continue
-            delta = to_ms(tm.group(1)) - start
-            if delta < -3000 or delta > 31000:
-                continue
-            if line in seen:
-                continue
-            seen.add(line)
-            lines.append(f"+{delta/1000:.3f}s {line}")
-    if len(lines) == 1:
-        lines.append("none")
-text = "\n".join(lines) + "\n"
-(out / f"foreground-events-{phase}.txt").write_text(text)
-print(text)
-PY
-  cat "$OUT/foreground-events-${phase}.txt" >> "$OUT/timeline.txt" || true
-}
-
 device_now_ms() {
-  adb shell date '+%s %N' | tr -d '\r' | python3 -c 'import sys; p=sys.stdin.read().split(); n=(p[1]+"000")[:3] if len(p)>1 and p[1].isdigit() else "0"; print(int(p[0])*1000+int(n))'
+  adb shell date '+%s %N' 2>/dev/null | tr -d '\r' | python3 -c '
+import sys
+parts = sys.stdin.read().split()
+if not parts or not parts[0].isdigit():
+    print(0)
+    raise SystemExit
+millis = 0
+if len(parts) > 1 and parts[1].isdigit():
+    millis = int((parts[1] + "000")[:3])
+print(int(parts[0]) * 1000 + millis)
+'
 }
 
-# Print epoch milliseconds for a logcat timestamp "MM-DD HH:MM:SS.mmm".
 log_time_ms() {
   python3 - "$1" <<'PY'
 import datetime, subprocess, sys
@@ -272,92 +94,228 @@ wait_until_ms() {
       return 0
     fi
     if [ $((target - now)) -gt 60000 ]; then
-      log "clock skew: target is $((target - now))ms ahead of device; capturing now"
-      echo "WAIT_SKEW now=$now target=$target" | tee -a "$OUT/timeline.txt"
+      log "clock skew ${target} vs ${now}; sampling now"
       return 0
     fi
     spins=$((spins + 1))
     if [ "$spins" -gt 200 ]; then
-      log "timed wait exceeded 40s; capturing now"
+      log "timed wait exceeded 40s; sampling now"
       return 0
     fi
     sleep 0.2
   done
 }
 
-screen_size() {
-  adb shell wm size | tr -d '\r' | awk -F '[ x:]+' '/Physical size/{print $3, $4}'
+count_launchers() {
+  local name="$1"
+  adb shell pm query-activities -a android.intent.action.MAIN -c android.intent.category.LAUNCHER > "$OUT/pm-query-activities-$name.txt" || true
+  python3 - "$OUT/pm-query-activities-$name.txt" <<'PY'
+import pathlib, re, sys
+text = pathlib.Path(sys.argv[1]).read_text(errors="replace")
+shorts = []
+patterns = (
+    r"name=(com\.example\.app\.(?:MainActivity|stencil|ionic|ionitron))\b",
+    r"(com\.example\.app/\.(?:MainActivity|stencil|ionic|ionitron))\b",
+    r"\b(com\.example\.app\.(?:MainActivity|stencil|ionic|ionitron))\b",
+)
+for pattern in patterns:
+    for item in re.findall(pattern, text):
+        short = item.split("/")[-1].split(".")[-1]
+        if short not in shorts:
+            shorts.append(short)
+names = ["com.example.app/." + short for short in shorts]
+print("launchers=%d names=%s" % (len(names), ",".join(names) if names else "-"))
+PY
 }
 
-dump_ui() {
-  local dest="$1"
-  local i
-  for i in 1 2 3 4 5; do
-    if adb shell uiautomator dump /sdcard/ui-ai66.xml >/dev/null 2>&1; then
-      adb pull /sdcard/ui-ai66.xml "$dest" >/dev/null
-      return 0
-    fi
-    sleep 1
-  done
-  return 1
+capture_resumed() {
+  local name="$1"
+  adb shell "dumpsys activity activities | grep -E 'topResumedActivity=|ResumedActivity:'" > "$OUT/resumed-$name.txt" || true
 }
 
-home_shot() {
-  local label="$1"
-  local png="$2"
-  local xml="$3"
-  adb shell input keyevent KEYCODE_HOME || true
-  sleep 2
-  dump_ui "$xml" || true
-  if grep -q "text=\"${label}\"" "$xml" 2>/dev/null || grep -q "content-desc=\"${label}\"" "$xml" 2>/dev/null; then
-    shot "$png"
-    log "home shows $label"
-    return 0
+append_sample() {
+  local phase="$1"
+  local offset="$2"
+  local pid="$3"
+  local resumed="$4"
+  local count_line="$5"
+  local at_ms="$6"
+  python3 - "$OUT/samples-${phase}.jsonl" "$offset" "$pid" "$resumed" "$count_line" "$at_ms" <<'PY'
+import json, re, sys
+path, offset, pid, resumed, count_line, at_ms = sys.argv[1:]
+match = re.search(r"launchers=(\d+)", count_line)
+names = []
+named = re.search(r"names=(\S+)", count_line)
+if named and named.group(1) != "-":
+    names = named.group(1).split(",")
+try:
+    offset_value = int(offset)
+except ValueError:
+    offset_value = offset
+row = {
+    "offset_s": offset_value,
+    "pid": pid.strip(),
+    "resumed": resumed.strip(),
+    "launchers": int(match.group(1)) if match else None,
+    "names": names,
+    "at_ms": int(at_ms) if at_ms.isdigit() else None,
+}
+with open(path, "a", encoding="utf-8") as handle:
+    handle.write(json.dumps(row) + "\n")
+PY
+}
+
+capture_sample() {
+  local phase="$1"
+  local offset="$2"
+  local name="${phase}-${offset}"
+  local at pid resumed launchers
+  at="$(device_now_ms)"
+  save_pid "$name"
+  pid="$(tr -d '\r' < "$OUT/pid-$name.txt")"
+  capture_resumed "$name"
+  resumed="$(paste -sd ' | ' "$OUT/resumed-$name.txt" 2>/dev/null || true)"
+  launchers="$(count_launchers "$name" | tail -n 1)"
+  append_sample "$phase" "$offset" "$pid" "$resumed" "$launchers" "$at"
+  printf '%s sample +%s %s pid=%s resumed=%s\n' "$phase" "$offset" "$launchers" "${pid:-<none>}" "${resumed:-<none>}" | tee -a "$OUT/timeline.txt"
+  if [ "$offset" = "0" ] || [ "$offset" = "30" ] || [ "$offset" = "pre_home" ]; then
+    shot "$OUT/screen-$name.png"
+    adb shell dumpsys activity activities > "$OUT/dumpsys-activities-$name.txt" || true
   fi
-  # Best-effort: drag the labeled icon from the drawer onto the workspace.
-  # Do not force-stop the launcher; that drops the shortcut.
-  local W H
-  read -r W H < <(screen_size || true)
-  if [ -n "${W:-}" ]; then
-    adb shell input swipe $((W / 2)) $((H * 85 / 100)) $((W / 2)) $((H * 25 / 100)) 250 || true
-    sleep 2
-    dump_ui "$xml" || true
+}
+
+hold_foreground() {
+  local phase="$1"
+  local anchor anchor_ms offset
+  adb shell input keyevent KEYCODE_WAKEUP || true
+  anchor="$(tr -d '\r' < "$OUT/anchor-line-${phase}.txt")"
+  if [ -z "$anchor" ]; then
+    echo "NO_ANCHOR $phase" | tee -a "$OUT/timeline.txt"
+    return 1
   fi
-  shot "$png"
-  if grep -q "text=\"${label}\"" "$xml" 2>/dev/null; then
-    log "drawer/home shows $label"
+  capture_sample "$phase" 0
+  anchor_ms="$(log_time_ms "$anchor" || true)"
+  echo "$phase anchor_ms=$anchor_ms" | tee -a "$OUT/timeline.txt"
+  if printf '%s' "$anchor_ms" | grep -Eq '^[0-9]+$'; then
+    for offset in 2 5 10 15 20 30; do
+      wait_until_ms $((anchor_ms + offset * 1000))
+      capture_sample "$phase" "$offset"
+    done
   else
-    log "home screenshot saved without label $label"
+    log "anchor clock failed; sampling on a sleep schedule"
+    local previous=0 gap
+    for offset in 2 5 10 15 20 30; do
+      gap=$((offset - previous))
+      sleep "$gap"
+      capture_sample "$phase" "$offset"
+      previous=$offset
+    done
   fi
+  capture_sample "$phase" pre_home
 }
 
-wait_log() {
-  local pat="$1"
-  local secs="$2"
-  local i
-  for i in $(seq 1 "$secs"); do
-    if adb logcat -d -b main -b system -b crash | grep -q "$pat"; then
-      log "saw $pat after ${i}s"
-      return 0
+press_home() {
+  local phase="$1"
+  local home_ms start now line marker
+  adb shell "log -p I -t AI66 'AI66_HOME ${phase}'" || adb shell "log -t AI66 'AI66_HOME ${phase}'" || true
+  sleep 0.3
+  marker="$(adb logcat -d -b main -v threadtime | grep -F "AI66_HOME ${phase}" | tail -1 || true)"
+  printf '%s\n' "$marker" > "$OUT/home-line-${phase}.txt"
+  home_ms="$(device_now_ms)"
+  printf '%s\n' "$home_ms" > "$OUT/home-ms-${phase}.txt"
+  adb shell input keyevent KEYCODE_HOME || true
+  echo "$phase HOME ms=$home_ms marker=$marker" | tee -a "$OUT/timeline.txt"
+  : > "$OUT/home-poll-${phase}.jsonl"
+  start="$(device_now_ms)"
+  local spins=0 retried=0
+  while true; do
+    spins=$((spins + 1))
+    now="$(device_now_ms)"
+    line="$(count_launchers "${phase}-poll" | tail -n 1)"
+    python3 - "$OUT/home-poll-${phase}.jsonl" "$now" "$line" <<'PY'
+import json, re, sys
+path, now, line = sys.argv[1:]
+match = re.search(r"launchers=(\d+)", line)
+names = []
+named = re.search(r"names=(\S+)", line)
+if named and named.group(1) != "-":
+    names = named.group(1).split(",")
+row = {
+    "at_ms": int(now) if str(now).isdigit() else None,
+    "launchers": int(match.group(1)) if match else None,
+    "names": names,
+}
+with open(path, "a", encoding="utf-8") as handle:
+    handle.write(json.dumps(row) + "\n")
+print(json.dumps(row))
+PY
+    if printf '%s' "$line" | grep -Eq 'launchers=1([^0-9]|$)'; then
+      break
     fi
-    sleep 1
+    if [ "$retried" -eq 0 ] && [ $((now - home_ms)) -ge 2000 ]; then
+      retried=1
+      if adb shell "dumpsys activity activities | grep -m1 topResumedActivity=" | grep -q "$PKG"; then
+        log "app still resumed after HOME; sending HOME again"
+        adb shell input keyevent KEYCODE_HOME || true
+        adb shell am start -a android.intent.action.MAIN -c android.intent.category.HOME > "$OUT/am-home-${phase}.txt" 2>&1 || true
+      fi
+    fi
+    if [ $((now - start)) -ge 10000 ] || [ "$spins" -gt 25 ]; then
+      break
+    fi
+    sleep 0.5
   done
-  log "timeout waiting for $pat"
-  return 1
+  shot "$OUT/screen-home-after-${phase}.png"
+  adb shell dumpsys package "$PKG" > "$OUT/dumpsys-package-home-after-${phase}.txt" || true
+  cp "$OUT/pm-query-activities-${phase}-poll.txt" "$OUT/pm-query-activities-home-after-${phase}.txt" || true
 }
 
 broadcast() {
   local action="$1"
   local icon="${2:-}"
-  if [ -n "$icon" ]; then
+  local nonce="${3:-}"
+  if [ -n "$icon" ] && [ -n "$nonce" ]; then
+    adb shell am broadcast -n "$PKG/.HarnessReceiver" -a "$PKG.AI66" --es evidenceAction "$action" --es evidenceIcon "$icon" --es evidenceNonce "$nonce"
+  elif [ -n "$nonce" ]; then
+    adb shell am broadcast -n "$PKG/.HarnessReceiver" -a "$PKG.AI66" --es evidenceAction "$action" --es evidenceNonce "$nonce"
+  elif [ -n "$icon" ]; then
     adb shell am broadcast -n "$PKG/.HarnessReceiver" -a "$PKG.AI66" --es evidenceAction "$action" --es evidenceIcon "$icon"
   else
     adb shell am broadcast -n "$PKG/.HarnessReceiver" -a "$PKG.AI66" --es evidenceAction "$action"
   fi
 }
 
+wait_log() {
+  local pattern="$1"
+  local secs="$2"
+  local i
+  for i in $(seq 1 "$secs"); do
+    if adb logcat -d -b main -b system -b crash | grep -q "$pattern"; then
+      log "saw $pattern after ${i}s"
+      return 0
+    fi
+    sleep 1
+  done
+  log "timeout waiting for $pattern"
+  return 1
+}
+
+save_anchor() {
+  local phase="$1"
+  local token="$2"
+  local line
+  line="$(adb logcat -d -b main -b system -b crash -v threadtime | grep -F "$token" | head -1 || true)"
+  printf '%s\n' "$line" > "$OUT/anchor-line-${phase}.txt"
+  printf '%s anchor %s\n' "$phase" "$line" | tee -a "$OUT/timeline.txt"
+  [ -n "$line" ]
+}
+
+if [ ! -f "$APK" ]; then
+  log "missing apk $APK"
+  exit 1
+fi
+
 log "apk=$APK"
-ls -lh "$APK"
 {
   echo "sha $(git -C "$ROOT" rev-parse HEAD)"
   echo "branch $(git -C "$ROOT" rev-parse --abbrev-ref HEAD)"
@@ -366,184 +324,91 @@ ls -lh "$APK"
   adb shell getprop ro.build.version.sdk || true
   adb shell getprop ro.build.version.release || true
 } | tee "$OUT/device-and-git.txt"
-
+printf '%s\n' "${AI66_VARIANT:-unset}" > "$OUT/variant.txt"
 cp "$ROOT/example/android/app/src/main/AndroidManifest.xml" "$OUT/AndroidManifest.xml"
-grep -n "LAUNCHER" "$OUT/AndroidManifest.xml" > "$OUT/manifest-launcher-lines.txt" || true
+cp "$ROOT/android/src/main/java/com/mycompany/plugins/example/AppIconBase.java" "$OUT/AppIconBase.java"
 if ! grep -q '<!-- <category android:name="android.intent.category.LAUNCHER" /> -->' "$OUT/AndroidManifest.xml"; then
   log "manifest is not the documented setup"
   echo "MANIFEST_UNEXPECTED" > "$OUT/manifest-check.txt"
   exit 1
 fi
 echo "MANIFEST_OK" > "$OUT/manifest-check.txt"
-printf '%s\n' "${AI66_VARIANT:-unset}" > "$OUT/variant.txt"
-cp "$ROOT/android/src/main/java/com/mycompany/plugins/example/AppIconBase.java" "$OUT/AppIconBase.java"
 
 adb wait-for-device
 adb shell input keyevent KEYCODE_WAKEUP || true
 adb shell wm dismiss-keyguard || true
 adb shell settings put system screen_off_timeout 1800000 || true
+adb shell settings put global stay_on_while_plugged_in 7 || true
+adb shell svc power stayon true || true
+adb logcat -G 16M || true
 
 adb uninstall "$PKG" || true
 adb install -r "$APK"
 adb logcat -b all -c || true
 adb shell am start -W -n "$PKG/.stencil" > "$OUT/am-start-initial.txt" || true
-
-if ! wait_log "AI66" 40; then
-  log "activity did not log AI66; continuing to poll the UI"
-fi
+wait_log "AI66" 40 || true
 for i in $(seq 1 30); do
-  if dump_ui "$OUT/ui-before.xml" && grep -q "Swap App Icon" "$OUT/ui-before.xml"; then
-    log "ui ready after ${i} polls"
-    break
+  if adb shell uiautomator dump /sdcard/ui-ai66.xml >/dev/null 2>&1; then
+    adb pull /sdcard/ui-ai66.xml "$OUT/ui-before.xml" >/dev/null || true
+    if grep -q "Swap App Icon" "$OUT/ui-before.xml" 2>/dev/null; then
+      log "ui ready after ${i} polls"
+      break
+    fi
   fi
   sleep 2
 done
 
-capture_phase "before"
-PID_BEFORE="$(pidof_pkg)"
-
+: > "$OUT/timeline.txt"
 stdbuf -oL adb logcat -v threadtime > "$OUT/logcat-main.txt" &
 MAIN_PID=$!
 stdbuf -oL adb logcat -b events -v threadtime > "$OUT/logcat-events.txt" &
 EVENTS_PID=$!
-adb shell screenrecord --time-limit 180 /sdcard/ai66.mp4 > "$OUT/screenrecord-start.txt" 2>&1 &
 sleep 1
 
-: > "$OUT/timeline.txt"
 log "broadcast change"
-broadcast change ionic | tee "$OUT/broadcast-change.txt" || true
-if ! wait_log "REQUEST change:ionic" 12; then
-  log "broadcast did not deliver; falling back to am start on the running alias"
-  echo "fallback_am_start_before_window" | tee -a "$OUT/timeline.txt"
-  adb shell am start -n "$PKG/.stencil" --es evidenceAction change --es evidenceIcon ionic > "$OUT/am-start-change-fallback.txt" || true
-  wait_log "REQUEST change:ionic" 12 || true
+broadcast change ionic change | tee "$OUT/broadcast-change.txt" || true
+wait_log "AI66_CHANGE_OK" 30 || true
+save_anchor change "AI66_CHANGE_OK" || true
+if [ -s "$OUT/anchor-line-change.txt" ]; then
+  broadcast getname "" change | tee "$OUT/broadcast-getname-change.txt" || true
+  echo "=== change foreground ===" | tee -a "$OUT/timeline.txt"
+  hold_foreground change || true
+  press_home change
+else
+  echo "change was not delivered" | tee -a "$OUT/timeline.txt"
 fi
-wait_log "AI66_CHANGE_OK" 25 || wait_log "AI66_CHANGE_CALL" 5 || wait_log "EVAL change" 5 || true
 
-ANCHOR_LINE="$(adb logcat -d -b main -b system -b crash -v threadtime | grep -F "AI66_CHANGE_OK" | head -1 || true)"
-ANCHOR_KIND="CHANGE_OK"
-if [ -z "$ANCHOR_LINE" ]; then
-  ANCHOR_LINE="$(adb logcat -d -b main -b system -b crash -v threadtime | grep -F "AI66_CHANGE_CALL" | head -1 || true)"
-  ANCHOR_KIND="CHANGE_CALL"
-fi
-if [ -z "$ANCHOR_LINE" ]; then
-  ANCHOR_LINE="$(adb logcat -d -b main -b system -b crash -v threadtime | grep -F "EVAL change" | head -1 || true)"
-  ANCHOR_KIND="EVAL_CHANGE"
-fi
-printf 'change anchor kind=%s line=%s\n' "$ANCHOR_KIND" "$ANCHOR_LINE" | tee -a "$OUT/timeline.txt"
-printf '%s\n' "$ANCHOR_LINE" > "$OUT/anchor-line-change.txt"
-echo "=== change foreground ===" | tee -a "$OUT/timeline.txt"
-hold_foreground change
-write_window_events change
-
-# Launcher detail and home only after the 30s foreground window.
-launcher_queries "after-change"
-home_shot "Ionic" "$OUT/screen-home-after-change.png" "$OUT/ui-home-after-change.xml" || true
-launcher_queries "home-after-change"
-PID_AFTER_CHANGE="$(pidof_pkg)"
-
-echo "=== reset ===" | tee -a "$OUT/timeline.txt"
-PID_BEFORE_RESET="$(pidof_pkg)"
-log "bringing the app forward before reset (pid=${PID_BEFORE_RESET:-<none>})"
+echo "=== reset bring-forward ===" | tee -a "$OUT/timeline.txt"
 for component in "$PKG/.ionic" "$PKG/.stencil" "$PKG/.MainActivity"; do
   short="${component##*.}"
-  if adb shell am start -n "$component" > "$OUT/am-start-before-reset-$short.txt" 2>&1; then
-    log "started $component before reset"
-    break
+  if adb shell am start -W -n "$component" > "$OUT/am-start-before-reset-$short.txt" 2>&1; then
+    if ! grep -Eqi "error|unable to resolve|does not exist" "$OUT/am-start-before-reset-$short.txt"; then
+      log "started $component before reset"
+      break
+    fi
   fi
   log "could not start $component before reset"
 done
-sleep 3
-broadcast reset | tee "$OUT/broadcast-reset.txt" || true
-if ! wait_log "REQUEST reset:" 12; then
-  log "reset broadcast missed; trying am start"
-  adb shell am start -n "$PKG/.ionic" --es evidenceAction reset > "$OUT/am-start-reset-fallback.txt" 2>&1 || \
-    adb shell am start -n "$PKG/.stencil" --es evidenceAction reset > "$OUT/am-start-reset-fallback.txt" 2>&1 || \
-    adb shell am start -n "$PKG/.MainActivity" --es evidenceAction reset > "$OUT/am-start-reset-fallback.txt" 2>&1 || true
-  wait_log "REQUEST reset:" 12 || true
-fi
-wait_log "AI66_RESET_OK" 25 || wait_log "AI66_RESET_CALL" 5 || wait_log "EVAL reset" 5 || true
+sleep 4
 
-ANCHOR_LINE="$(adb logcat -d -b main -b system -b crash -v threadtime | grep -F "AI66_RESET_OK" | head -1 || true)"
-ANCHOR_KIND="RESET_OK"
-if [ -z "$ANCHOR_LINE" ]; then
-  ANCHOR_LINE="$(adb logcat -d -b main -b system -b crash -v threadtime | grep -F "AI66_RESET_CALL" | head -1 || true)"
-  ANCHOR_KIND="RESET_CALL"
+log "broadcast reset"
+broadcast reset "" reset | tee "$OUT/broadcast-reset.txt" || true
+wait_log "AI66_RESET_OK" 30 || true
+save_anchor reset "AI66_RESET_OK" || true
+if [ -s "$OUT/anchor-line-reset.txt" ]; then
+  broadcast getname "" reset2 | tee "$OUT/broadcast-getname-reset.txt" || true
+  echo "=== reset foreground ===" | tee -a "$OUT/timeline.txt"
+  hold_foreground reset || true
+  press_home reset
+else
+  echo "reset was not delivered" | tee -a "$OUT/timeline.txt"
 fi
-if [ -z "$ANCHOR_LINE" ]; then
-  ANCHOR_LINE="$(adb logcat -d -b main -b system -b crash -v threadtime | grep -F "EVAL reset" | head -1 || true)"
-  ANCHOR_KIND="EVAL_RESET"
-fi
-printf 'reset anchor kind=%s line=%s\n' "$ANCHOR_KIND" "$ANCHOR_LINE" | tee -a "$OUT/timeline.txt"
-printf '%s\n' "$ANCHOR_LINE" > "$OUT/anchor-line-reset.txt"
-echo "=== reset foreground ===" | tee -a "$OUT/timeline.txt"
-hold_foreground reset
-write_window_events reset
-launcher_queries "after-reset"
-home_shot "Stencil" "$OUT/screen-home-after-reset.png" "$OUT/ui-home-after-reset.xml" || true
-launcher_queries "home-after-reset"
 
-# getName is after both foreground windows. Upstream getName NPEs when the
-# launch intent is null; that stack is its own finding and must not be hidden.
-log "getName after reset captures"
-broadcast getname | tee "$OUT/broadcast-getname.txt" || true
-if ! wait_log "AI66_GETNAME_CALL" 12; then
-  log "getName broadcast missed; bringing the default alias forward"
-  adb shell am start -n "$PKG/.stencil" > "$OUT/am-start-before-getname.txt" 2>&1 || \
-    adb shell am start -n "$PKG/.ionic" > "$OUT/am-start-before-getname.txt" 2>&1 || true
-  sleep 2
-  broadcast getname | tee -a "$OUT/broadcast-getname.txt" || true
-  wait_log "AI66_GETNAME_CALL" 15 || true
-fi
-sleep 3
-adb logcat -d -v threadtime -b main -b system -b crash > "$OUT/getname-logcat.txt" || true
-python3 - "$OUT/getname-logcat.txt" "$OUT/getname-stack.txt" <<'PY' || true
-import pathlib, sys
-text = pathlib.Path(sys.argv[1]).read_text(errors="replace").splitlines()
-start = 0
-for i, line in enumerate(text):
-    if "AI66_GETNAME_CALL" in line or "Fatal signal" in line or "FATAL EXCEPTION" in line:
-        start = i
-keys = ("AI66_GETNAME", "AndroidRuntime", "FATAL EXCEPTION", "NullPointerException", "AppIconBase.java", "Force finishing", "am_crash", "am_proc_died")
-kept = [line for line in text[max(0, start - 5):] if any(k in line for k in keys)]
-pathlib.Path(sys.argv[2]).write_text("\n".join(kept) + ("\n" if kept else "no getName lines\n"))
-PY
-
-adb shell kill -2 "$(adb shell pidof screenrecord | tr -d '\r')" >/dev/null 2>&1 || true
 sleep 2
-adb pull /sdcard/ai66.mp4 "$OUT/ai66.mp4" || log "no screenrecord"
-kill "$MAIN_PID" "$EVENTS_PID" >/dev/null 2>&1 || true
-wait "$MAIN_PID" "$EVENTS_PID" 2>/dev/null || true
-# Snapshots in case the streamed log was buffered.
 adb logcat -d -v threadtime -b main -b system -b crash > "$OUT/logcat-main-dump.txt" || true
 adb logcat -d -v threadtime -b events > "$OUT/logcat-events-dump.txt" || true
-
-python3 - "$OUT" <<'PY' || true
-import pathlib, re, sys
-out = pathlib.Path(sys.argv[1])
-patterns = re.compile(
-    r"am_finish_activity|am_kill|wm_finish_activity|am_proc_died|am_proc_start|"
-    r"am_on_resume_called|wm_resume_activity|wm_destroy_activity|wm_create_activity|"
-    r"am_crash|Force finishing|has died|AI66|AppIconBase|ActivityManager|ActivityTaskManager"
-)
-for name in ("logcat-main.txt", "logcat-events.txt", "logcat-main-dump.txt", "logcat-events-dump.txt"):
-    src = out / name
-    if not src.exists():
-        continue
-    kept = [line for line in src.read_text(errors="replace").splitlines() if patterns.search(line)]
-    (out / (name.replace(".txt", "") + ".filtered.txt")).write_text("\n".join(kept) + ("\n" if kept else ""))
-PY
-
-{
-  echo "pid_before=$PID_BEFORE"
-  echo "pid_after_change=$PID_AFTER_CHANGE"
-  echo "pid_before_reset=$PID_BEFORE_RESET"
-  echo "pid_after_reset=$(pidof_pkg)"
-} | tee "$OUT/pids.txt"
-
-if grep -q "REQUEST change:ionic" "$OUT/logcat-main.txt" "$OUT/logcat-main-dump.txt" 2>/dev/null; then
-  log "change request was delivered"
-  exit 0
-fi
-log "change request was never delivered"
-exit 1
+log "scoring"
+python3 "$ROOT/.github/scripts/ai66-score.py" "$OUT" > "$OUT/score-stdout.txt"
+score=$?
+cat "$OUT/score-stdout.txt"
+exit "$score"

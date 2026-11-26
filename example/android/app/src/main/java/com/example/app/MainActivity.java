@@ -39,7 +39,15 @@ public class MainActivity extends BridgeActivity {
     public void onResume() {
         super.onResume();
         instance = this;
-        Log.i(TAG, "RESUME pid=" + Process.myPid());
+        Log.i(
+            TAG,
+            "RESUME pid=" +
+                Process.myPid() +
+                " component=" +
+                getComponentName() +
+                " intent=" +
+                (getIntent() == null ? null : getIntent().getComponent())
+        );
         runFromIntent(getIntent());
     }
 
@@ -69,7 +77,8 @@ public class MainActivity extends BridgeActivity {
             Log.e(TAG, "REJECT icon=" + icon);
             return;
         }
-        String key = action + ":" + (icon == null ? "" : icon);
+        String nonce = intent.getStringExtra("evidenceNonce");
+        String key = action + ":" + (icon == null ? "" : icon) + ":" + (nonce == null ? "" : nonce);
         if (key.equals(lastRequest)) {
             return;
         }
